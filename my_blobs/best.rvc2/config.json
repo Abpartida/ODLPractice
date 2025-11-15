@@ -1,0 +1,44 @@
+{
+    "config_version": "1.0",
+    "model": {
+        "metadata": {
+            "name": "best",
+            "path": "best.superblob",
+            "precision": "float16"
+        },
+        "inputs": [
+            {
+                "name": "images",
+                "dtype": "uint8",
+                "input_type": "image",
+                "shape": [
+                    1,
+                    3,
+                    640,
+                    640
+                ],
+                "layout": "NCHW",
+                "preprocessing": {
+                    "mean": null,
+                    "scale": null,
+                    "reverse_channels": false,
+                    "interleaved_to_planar": false,
+                    "dai_type": "BGR888p"
+                }
+            }
+        ],
+        "outputs": [
+            {
+                "name": "output0",
+                "dtype": "float32",
+                "shape": [
+                    1,
+                    8,
+                    8400
+                ],
+                "layout": "NCD"
+            }
+        ],
+        "heads": []
+    }
+}
