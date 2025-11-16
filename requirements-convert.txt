@@ -1,0 +1,5 @@
+# Optional requirements for running convert_to_blob.py
+-r requirements.txt
+blobconverter==1.4.3
+ultralytics>=8.2.0,<9.0.0
+torch>=2.2.0,<3.0.0
