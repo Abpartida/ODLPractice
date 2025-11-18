@@ -45,6 +45,10 @@ def resolve_blob_path() -> str:
         Path("best.rvc2_legacy.rvc2/best.blob"),
         Path("best.rvc3/best.blob"),
         Path("best.superblob"),
+        Path("my_blobs/best.rvc2/best.blob"),
+        Path("my_blobs/best.rvc2_legacy.rvc2/best.blob"),
+        Path("my_blobs/best.rvc3/best.blob"),
+        Path("my_blobs/best.superblob"),
     ]
     for candidate in candidates:
         if not candidate.exists():
@@ -61,7 +65,7 @@ def resolve_blob_path() -> str:
 use_xlink = hasattr(dai.node, "XLinkOut")
 
 # Primary blob must always be available; secondary blob serves optional cameras.
-PRIMARY_BLOB_PATH = Path("best.rvc2_legacy.rvc2/best.blob")
+PRIMARY_BLOB_PATH = Path("my_blobs/best.rvc2_legacy.rvc2/best.blob")
 SECONDARY_BLOB_PATH = Path("my_blobs/best_openvino_2022.1_6shave.blob")
 
 
