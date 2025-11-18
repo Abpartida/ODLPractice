@@ -60,6 +60,10 @@ def resolve_blob_path() -> str:
 
 use_xlink = hasattr(dai.node, "XLinkOut")
 
+# Primary blob must always be available; secondary blob serves optional cameras.
+PRIMARY_BLOB_PATH = Path("best.rvc2_legacy.rvc2/best.blob")
+SECONDARY_BLOB_PATH = Path("my_blobs/best_openvino_2022.1_6shave.blob")
+
 
 @dataclass
 class CameraSetup:
@@ -82,6 +86,7 @@ class PipelineBundle:
     pipeline: dai.Pipeline
     host_outputs: dict[str, dai.Node.Output]
     streams: dict[str, str]
+    blob_path: str
 
 
 def build_pipeline(setup: CameraSetup) -> PipelineBundle:
@@ -97,7 +102,7 @@ def build_pipeline(setup: CameraSetup) -> PipelineBundle:
 
     rgb_stream = cam_rgb.preview
 
-    blob_path = setup.resolved_blob_path()
+    blob_path = str(Path(setup.resolved_blob_path()).resolve())
     nn = pipeline.create(dai.node.NeuralNetwork)
     nn.setBlobPath(blob_path)
     print(f"[INFO] Configured {setup.name} NN with blob: {blob_path}")
@@ -125,6 +130,7 @@ def build_pipeline(setup: CameraSetup) -> PipelineBundle:
         pipeline=pipeline,
         host_outputs=host_outputs,
         streams=stream_names,
+        blob_path=blob_path,
     )
 
 
@@ -201,10 +207,10 @@ def create_device_context(pipeline_obj: dai.Pipeline, device_info: dai.DeviceInf
             device.close()
 
 camera_setups = [
-    CameraSetup(name="camera_1", blob_path="my_blobs/best_openvino_2022.1_6shave.blob"),
-    CameraSetup(name="camera_2", blob_path="my_blobs/best_openvino_2022.1_6shave.blob"),
-    #CameraSetup(name="camera_3", blob_path="my_blobs/alternate_model_a.blob"),
-    #CameraSetup(name="camera_4", blob_path="my_blobs/alternate_model_b.blob"),
+    CameraSetup(name="primary_camera_1", blob_path=str(PRIMARY_BLOB_PATH)),
+    CameraSetup(name="primary_camera_2", blob_path=str(PRIMARY_BLOB_PATH)),
+    CameraSetup(name="secondary_camera_1", blob_path=str(SECONDARY_BLOB_PATH)),
+    CameraSetup(name="secondary_camera_2", blob_path=str(SECONDARY_BLOB_PATH)),
 ]
 
 pipeline_bundles: list[PipelineBundle] = []
@@ -223,6 +229,19 @@ if len(available_devices) < len(pipeline_bundles):
     )
 
 active_pairs = list(zip(pipeline_bundles, available_devices))
+if not active_pairs:
+    raise RuntimeError("[ERROR] Unable to pair pipelines with available devices.")
+
+primary_blob_resolved = str(PRIMARY_BLOB_PATH.resolve())
+primary_connected = any(bundle.blob_path == primary_blob_resolved for bundle, _ in active_pairs)
+if not primary_connected:
+    raise RuntimeError(
+        "[ERROR] At least one connected camera must run the primary blob "
+        f"({PRIMARY_BLOB_PATH}). Ensure a primary camera is connected."
+    )
+print(
+    f"[INFO] Activating {len(active_pairs)} of {len(pipeline_bundles)} configured camera pipeline(s)."
+)
 
 active_devices = []
 with ExitStack() as stack:
