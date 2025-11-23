@@ -385,6 +385,7 @@ with ExitStack() as stack:
                 "nn_queue": q_nn,
                 "cam_queue": q_cam,
                 "window": f"{bundle.setup.name} Inference",
+                "visible_traps": set(),
             }
         )
 
@@ -392,6 +393,7 @@ with ExitStack() as stack:
         raise RuntimeError("[ERROR] No active devices configured.")
 
     print("[INFO] Output queues initialized for all cameras.")
+    unique_traps_seen: set[int] = set()
     running = True
     while running:
         for active in active_devices:
@@ -441,6 +443,36 @@ with ExitStack() as stack:
             trap_detections = detect_pest_traps(frame)
             if trap_detections:
                 annotate_traps(frame, trap_detections, active["name"])
+            trap_ids_in_view = {detection["marker_id"] for detection in trap_detections}
+            active["visible_traps"] = trap_ids_in_view
+            unique_traps_seen.update(trap_ids_in_view)
+            trap_count_label = f"Traps visible: {len(trap_ids_in_view)}"
+            unique_count_label = f"Unique traps seen: {len(unique_traps_seen)}"
+            cv2.putText(
+                frame,
+                trap_count_label,
+                (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+            )
+            cv2.putText(
+                frame,
+                unique_count_label,
+                (10, 55),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+            )
+            if trap_ids_in_view:
+                print(
+                    f"[INFO] {active['name']}: Currently viewing {len(trap_ids_in_view)} trap(s): "
+                    f"{sorted(trap_ids_in_view)}"
+                )
+                print("[ACTION] Turn Off systems")
+                print(f"[METRIC] Unique traps seen so far: {len(unique_traps_seen)}")
             cv2.imshow(active["window"], frame)
 
         if cv2.waitKey(1) == ord("q"):
