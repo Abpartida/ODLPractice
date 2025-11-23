@@ -1,3 +1,5 @@
+import json
+import os
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,10 +11,139 @@ import numpy as np
 
 print("[INFO] Starting OAK-D YOLO pipeline...")
 
-# Load label map
-with open("labels.txt", "r", encoding="utf-8") as labels_file:
-    label_map = [line.strip() for line in labels_file if line.strip()]
-print(f"[INFO] Loaded {len(label_map)} labels.")
+
+def load_config(config_path: Path) -> dict[str, Any]:
+    with open(config_path, "r", encoding="utf-8") as config_file:
+        return json.load(config_file)
+
+
+def resolve_model_artifacts(result_dir: Path) -> tuple[Path, Path]:
+    """Pick the YOLO blob + json from the exported result folder."""
+    if not result_dir.exists():
+        raise FileNotFoundError(f"Result directory not found: {result_dir.resolve()}")
+
+    blob_files = sorted(result_dir.glob("*.blob"))
+    if not blob_files:
+        raise FileNotFoundError(f"No .blob files found under {result_dir.resolve()}")
+
+    json_files = sorted(result_dir.glob("*.json"))
+    if not json_files:
+        raise FileNotFoundError(f"No .json files found under {result_dir.resolve()}")
+
+    def _pick_preferred(paths: list[Path]) -> Path:
+        for path in paths:
+            if "best" in path.stem.lower():
+                return path
+        return paths[0]
+
+    return _pick_preferred(blob_files), _pick_preferred(json_files)
+
+
+RESULT_DIR = Path(os.environ.get("RESULT_DIR", "my_blobs/pestv5"))
+MODEL_CONFIG: dict[str, Any] | None = None
+DEFAULT_MODEL_BLOB: Path | None = None
+label_map: list[str] = []
+
+try:
+    DEFAULT_MODEL_BLOB, MODEL_CONFIG_PATH = resolve_model_artifacts(RESULT_DIR)
+    MODEL_CONFIG = load_config(MODEL_CONFIG_PATH)
+    label_map = MODEL_CONFIG.get("mappings", {}).get("labels", [])
+    print(f"[INFO] Loaded model config from {MODEL_CONFIG_PATH}.")
+except FileNotFoundError as err:
+    print(f"[WARN] {err}")
+
+if not label_map:
+    with open("labels.txt", "r", encoding="utf-8") as labels_file:
+        label_map = [line.strip() for line in labels_file if line.strip()]
+    print(f"[INFO] Loaded {len(label_map)} labels from labels.txt.")
+else:
+    print(f"[INFO] Loaded {len(label_map)} labels from model config.")
+
+
+DEFAULT_CAMERA_DIM = (640, 640)
+_BLOB_INPUT_CACHE: dict[str, tuple[int, int]] = {}
+_MIN_VALID_DIM = 16
+
+
+def _parse_size_string(size_str: str) -> tuple[int, int] | None:
+    if not isinstance(size_str, str) or "x" not in size_str:
+        return None
+    try:
+        width_str, height_str = size_str.lower().split("x")
+        return int(width_str), int(height_str)
+    except (ValueError, TypeError):
+        return None
+
+
+def resolve_input_dimensions(
+    model_config: dict[str, Any] | None, default_dim: tuple[int, int]
+) -> tuple[int, int]:
+    if not model_config:
+        return default_dim
+    size_str = model_config.get("nn_config", {}).get("input_size")
+    parsed = _parse_size_string(size_str) if isinstance(size_str, str) else None
+    if parsed:
+        return parsed
+    return default_dim
+
+
+def _infer_blob_input_size(blob_path: str) -> tuple[int, int] | None:
+    if blob_path in _BLOB_INPUT_CACHE:
+        return _BLOB_INPUT_CACHE[blob_path]
+    try:
+        blob = dai.OpenVINO.Blob(blob_path)
+    except RuntimeError as err:
+        print(f"[WARN] Unable to inspect blob input size for {blob_path}: {err}")
+        return None
+    inputs = getattr(blob, "networkInputs", {})
+    if not inputs:
+        return None
+    tensor_info = next(iter(inputs.values()))
+    dims = getattr(tensor_info, "dims", None)
+    if not dims or len(dims) < 4:
+        return None
+    dims = [int(value) for value in dims if isinstance(value, (int, float))]
+    candidate_dims = [val for val in dims if val > _MIN_VALID_DIM]
+    width: int | None = None
+    height: int | None = None
+    if len(candidate_dims) >= 2:
+        candidate_dims.sort()
+        height = candidate_dims[-2]
+        width = candidate_dims[-1]
+    elif len(dims) >= 4:
+        width = int(dims[-1])
+        height = int(dims[-2])
+
+    if width and height and width > _MIN_VALID_DIM and height > _MIN_VALID_DIM:
+        _BLOB_INPUT_CACHE[blob_path] = (width, height)
+        return _BLOB_INPUT_CACHE[blob_path]
+
+    print(
+        f"[WARN] Unable to determine valid input size from blob dims {dims} "
+        f"for {blob_path}; falling back to config/default."
+    )
+    return None
+
+
+def determine_pipeline_input_dim(
+    blob_path: str | None, fallback: tuple[int, int]
+) -> tuple[int, int]:
+    if "NN_INPUT_SIZE" in os.environ:
+        override = _parse_size_string(os.environ["NN_INPUT_SIZE"])
+        if override:
+            return override
+    if "MODEL_INPUT_SIZE" in os.environ:
+        override = _parse_size_string(os.environ["MODEL_INPUT_SIZE"])
+        if override:
+            return override
+    if blob_path:
+        blob_dim = _infer_blob_input_size(blob_path)
+        if blob_dim:
+            return blob_dim
+    return fallback
+
+
+CAMERA_PREVIEW_DIM = resolve_input_dimensions(MODEL_CONFIG, DEFAULT_CAMERA_DIM)
 
 
 def _build_aruco_detector() -> tuple[Any, Any, Any, Any]:
@@ -39,41 +170,20 @@ TRAP_REGISTRY: dict[int, dict[str, str]] = {
     2: {"name": "Trap C", "location": "East block, row 1"},
 }
 
-def resolve_blob_path() -> str:
-    candidates = [
-        Path("best.rvc2/best.blob"),
-        Path("best.rvc2_legacy.rvc2/best.blob"),
-        Path("best.rvc3/best.blob"),
-        Path("best.superblob"),
-    ]
-    for candidate in candidates:
-        if not candidate.exists():
-            continue
-        if candidate.suffix == ".superblob":
-            try:
-                dai.OpenVINO.Blob(str(candidate))
-            except RuntimeError:
-                continue
-        print(f"[INFO] Using blob: {candidate}")
-        return str(candidate)
-    raise FileNotFoundError("No supported DepthAI blob found.")
-
 use_xlink = hasattr(dai.node, "XLinkOut")
 
 
 @dataclass
 class CameraSetup:
     name: str
-    blob_path: str | None = None
+    blob_path: str
 
     def resolved_blob_path(self) -> str:
-        if self.blob_path:
-            candidate = Path(self.blob_path)
-            if candidate.exists():
-                print(f"[INFO] {self.name}: Using blob {candidate}")
-                return str(candidate)
-            raise FileNotFoundError(f"{self.name}: blob not found at {self.blob_path}")
-        return resolve_blob_path()
+        candidate = Path(self.blob_path)
+        if candidate.exists():
+            print(f"[INFO] {self.name}: Using blob {candidate}")
+            return str(candidate)
+        raise FileNotFoundError(f"{self.name}: blob not found at {self.blob_path}")
 
 
 @dataclass
@@ -84,40 +194,75 @@ class PipelineBundle:
     streams: dict[str, str]
 
 
+def create_yolo_pipeline_nodes(
+    pipeline: dai.Pipeline, model_config: dict[str, Any], blob_path: str, input_dim: tuple[int, int]
+) -> tuple[dai.Node.Output, dai.Node.Output]:
+    """Configure the ColorCamera + YoloDetectionNetwork graph from the working script."""
+    nn_config = model_config.get("nn_config", {})
+    metadata = nn_config.get("NN_specific_metadata", {})
+
+    classes = int(metadata.get("classes", len(label_map)))
+    coordinates = int(metadata.get("coordinates", 4))
+    anchors = metadata.get("anchors", []) or []
+    anchor_masks = metadata.get("anchor_masks", {}) or {}
+    iou_threshold = float(metadata.get("iou_threshold", 0.5))
+    confidence_threshold = float(metadata.get("confidence_threshold", 0.5))
+
+    input_width, input_height = input_dim
+
+    cam_rgb = pipeline.create(dai.node.ColorCamera)
+    cam_rgb.setPreviewSize(input_width, input_height)
+    cam_rgb.setInterleaved(False)
+    cam_rgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
+    cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+    cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+
+    detection_network = pipeline.create(dai.node.YoloDetectionNetwork)
+    detection_network.setConfidenceThreshold(confidence_threshold)
+    detection_network.setNumClasses(classes)
+    detection_network.setCoordinateSize(coordinates)
+    if anchors:
+        detection_network.setAnchors(anchors)
+    if anchor_masks:
+        detection_network.setAnchorMasks(anchor_masks)
+    detection_network.setIouThreshold(iou_threshold)
+    detection_network.setBlobPath(blob_path)
+    detection_network.setNumInferenceThreads(2)
+    detection_network.input.setBlocking(False)
+
+    cam_rgb.preview.link(detection_network.input)
+    return detection_network.passthrough, detection_network.out
+
+
 def build_pipeline(setup: CameraSetup) -> PipelineBundle:
     pipeline = dai.Pipeline()
 
-    cam_rgb = pipeline.create(dai.node.ColorCamera)
-    cam_rgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
-    cam_rgb.setPreviewSize(640, 640)
-    cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-    cam_rgb.setInterleaved(False)
-    cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
-    cam_rgb.setFps(30)
-
-    rgb_stream = cam_rgb.preview
-
     blob_path = setup.resolved_blob_path()
-    nn = pipeline.create(dai.node.NeuralNetwork)
-    nn.setBlobPath(blob_path)
-    print(f"[INFO] Configured {setup.name} NN with blob: {blob_path}")
-    rgb_stream.link(nn.input)
-
     host_outputs: dict[str, dai.Node.Output] = {}
     stream_names = {"nn": f"{setup.name}_nn", "cam": f"{setup.name}_cam"}
+    input_dim = determine_pipeline_input_dim(blob_path, CAMERA_PREVIEW_DIM)
+    print(f"[INFO] {setup.name}: Using input size {input_dim[0]}x{input_dim[1]}.")
+
+    if not MODEL_CONFIG:
+        raise RuntimeError("MODEL_CONFIG must be available for YOLOv5 pipelines.")
+
+    cam_output, nn_output = create_yolo_pipeline_nodes(
+        pipeline, MODEL_CONFIG, blob_path, input_dim
+    )
+    print(f"[INFO] {setup.name}: Using YoloDetectionNetwork with blob {blob_path}.")
 
     if use_xlink:
         nn_xout = pipeline.create(dai.node.XLinkOut)
         nn_xout.setStreamName(stream_names["nn"])
-        nn.out.link(nn_xout.input)
+        nn_output.link(nn_xout.input)
 
         cam_xout = pipeline.create(dai.node.XLinkOut)
         cam_xout.setStreamName(stream_names["cam"])
-        rgb_stream.link(cam_xout.input)
+        cam_output.link(cam_xout.input)
         print(f"[INFO] {setup.name}: Using XLinkOut for outputs.")
     else:
-        host_outputs["nn"] = nn.out
-        host_outputs["cam"] = rgb_stream
+        host_outputs["nn"] = nn_output
+        host_outputs["cam"] = cam_output
         print(f"[INFO] {setup.name}: Using host outputs.")
 
     return PipelineBundle(
@@ -181,30 +326,25 @@ def annotate_traps(frame: np.ndarray, trap_detections: list[dict[str, Any]], cam
 def create_device_context(pipeline_obj: dai.Pipeline, device_info: dai.DeviceInfo | None = None):
     device = None
     try:
-        pipeline_started = False
-        try:
-            if device_info is None:
-                device = dai.Device(pipeline_obj)
-            else:
-                device = dai.Device(pipeline_obj, device_info)
-            pipeline_started = True
-        except TypeError:
-            if device_info is None:
-                device = dai.Device()
-            else:
+        if device_info is None:
+            device = dai.Device(pipeline_obj)
+        else:
+            try:
+                device = dai.Device(device_info, usbSpeed=dai.UsbSpeed.SUPER)
+            except TypeError:
                 device = dai.Device(device_info)
-        if not pipeline_started and hasattr(device, "startPipeline"):
-            device.startPipeline(pipeline_obj)
+            if hasattr(device, "startPipeline"):
+                device.startPipeline(pipeline_obj)
         yield device
     finally:
         if device is not None:
             device.close()
 
 camera_setups = [
-    CameraSetup(name="camera_1", blob_path="my_blobs/best_openvino_2022.1_6shave.blob"),
-    CameraSetup(name="camera_2", blob_path="my_blobs/best_openvino_2022.1_6shave.blob"),
-    #CameraSetup(name="camera_3", blob_path="my_blobs/alternate_model_a.blob"),
-    #CameraSetup(name="camera_4", blob_path="my_blobs/alternate_model_b.blob"),
+    CameraSetup(name="camera_1_left", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
+    CameraSetup(name="camera_2_right", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
+    #CameraSetup(name="camera_3_front", blob_path="my_blobs/alternate_model_a.blob"),
+    #CameraSetup(name="camera_4_back", blob_path="my_blobs/alternate_model_b.blob"),
 ]
 
 pipeline_bundles: list[PipelineBundle] = []
