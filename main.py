@@ -416,11 +416,12 @@ def annotate_traps(frame: np.ndarray, trap_detections: list[dict[str, Any]], cam
         center = corners.mean(axis=0).astype(int)
         label = f"{detection['trap_name']} (ID {detection['marker_id']})"
         location = detection["location"]
-        cv2.putText(frame, label, tuple(center), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Shift label and location text further down to avoid overlap with camera label
+        cv2.putText(frame, label, (center[0], center[1] + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         cv2.putText(
             frame,
             location,
-            (center[0], center[1] + 15),
+            (center[0], center[1] + 60),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
             (255, 255, 255),
