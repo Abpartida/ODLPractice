@@ -520,10 +520,10 @@ with ExitStack() as stack:
                 )
                 print("[ACTION] Turn Off systems")
                 print(f"[METRIC] Unique traps seen so far: {len(unique_traps_seen)}")
-            cv2.imshow(active["window"], frame)
+            # cv2.imshow(active["window"], frame)  # Disabled for headless/web streaming
 
-        if cv2.waitKey(1) == ord("q"):
-            running = False
+        # if cv2.waitKey(1) == ord("q"):
+        #     running = False
 
-cv2.destroyAllWindows()
+# cv2.destroyAllWindows()
 print("[INFO] Exiting pipeline.")
