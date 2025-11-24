@@ -1,5 +1,7 @@
 import json
 import os
+import csv
+from datetime import datetime
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -441,6 +443,10 @@ with ExitStack() as stack:
 
     print("[INFO] Output queues initialized for all cameras.")
     unique_traps_seen: set[int] = set()
+    log_file_path = "detections_log.csv"
+    with open(log_file_path, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["timestamp", "camera", "label", "confidence", "x1", "y1", "x2", "y2", "trap_id", "trap_name", "trap_location"])
     running = True
     while running:
         for active in active_devices:
@@ -460,6 +466,8 @@ with ExitStack() as stack:
                     print(f"[INFO] {active['name']}: {len(detections)} detections received.")
                 else:
                     print(f"[WARN] {active['name']}: No 'detections' attribute in NN output.")
+
+            trap_detections = detect_pest_traps(frame)
 
             for det in detections:
                 if det.confidence < 0.3:
@@ -487,7 +495,35 @@ with ExitStack() as stack:
                     1,
                 )
 
-            trap_detections = detect_pest_traps(frame)
+                # Logging detection to CSV
+                timestamp = datetime.now().isoformat()
+                trap_info = {"marker_id": None, "name": "", "location": ""}
+                for det_trap in trap_detections:
+                    if (x1 >= det_trap["corners"][:,0].min() and x2 <= det_trap["corners"][:,0].max() and
+                        y1 >= det_trap["corners"][:,1].min() and y2 <= det_trap["corners"][:,1].max()):
+                        trap_info = {
+                            "marker_id": det_trap["marker_id"],
+                            "name": det_trap["trap_name"],
+                            "location": det_trap["location"]
+                        }
+                        break
+
+                with open(log_file_path, mode='a', newline='') as file:
+                    writer = csv.writer(file)
+                    writer.writerow([
+                        timestamp,
+                        active["name"],
+                        label,
+                        f"{confidence:.2f}",
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        trap_info["marker_id"],
+                        trap_info["name"],
+                        trap_info["location"]
+                    ])
+
             if trap_detections:
                 annotate_traps(frame, trap_detections, active["name"])
             trap_ids_in_view = {detection["marker_id"] for detection in trap_detections}
