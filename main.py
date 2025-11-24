@@ -424,7 +424,7 @@ def annotate_traps(frame: np.ndarray, trap_detections: list[dict[str, Any]], cam
             (10, frame.shape[0] - 20),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
-            (255, 255, 255),
+            (255, 255, 155),
             1,
         )
         print(
