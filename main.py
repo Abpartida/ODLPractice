@@ -172,10 +172,6 @@ TRAP_REGISTRY: dict[int, dict[str, str]] = {
 
 use_xlink = hasattr(dai.node, "XLinkOut")
 
-# Primary blob must always be available; secondary blob serves optional cameras.
-PRIMARY_BLOB_PATH = Path("my_blobs/best.rvc2_legacy.rvc2/best.blob")
-SECONDARY_BLOB_PATH = Path("my_blobs/best_openvino_2022.1_6shave.blob")
-
 
 @dataclass
 class CameraSetup:
@@ -196,6 +192,7 @@ class PipelineBundle:
     pipeline: dai.Pipeline
     host_outputs: dict[str, dai.Node.Output]
     streams: dict[str, str]
+    blob_path: str
 
 
 
@@ -412,16 +409,7 @@ active_pairs = list(zip(pipeline_bundles, available_devices))
 if not active_pairs:
     raise RuntimeError("[ERROR] Unable to pair pipelines with available devices.")
 
-primary_blob_resolved = str(PRIMARY_BLOB_PATH.resolve())
-primary_connected = any(bundle.blob_path == primary_blob_resolved for bundle, _ in active_pairs)
-if not primary_connected:
-    raise RuntimeError(
-        "[ERROR] At least one connected camera must run the primary blob "
-        f"({PRIMARY_BLOB_PATH}). Ensure a primary camera is connected."
-    )
-print(
-    f"[INFO] Activating {len(active_pairs)} of {len(pipeline_bundles)} configured camera pipeline(s)."
-)
+print(f"[INFO] Activating {len(active_pairs)} of {len(pipeline_bundles)} configured camera pipeline(s).")
 
 active_devices = []
 with ExitStack() as stack:
