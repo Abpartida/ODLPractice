@@ -17,18 +17,53 @@ import time
 print("[INFO] Starting OAK-D YOLO pipeline...")
 
 
-latest_frame = None
+latest_frames = {}
 
 # --- Flask App Setup ---
 app = Flask(__name__)
 
 def generate_frames():
-    global latest_frame
+    global latest_frames
     while True:
-        if latest_frame is None:
+        if not latest_frames:
             time.sleep(0.1)
             continue
-        ret, buffer = cv2.imencode('.jpg', latest_frame)
+        try:
+            frames = [f for f in latest_frames.values() if f is not None]
+            if not frames:
+                time.sleep(0.1)
+                continue
+
+            # Resize all frames to the size of the first frame
+            target_size = (frames[0].shape[1], frames[0].shape[0])
+            resized_frames = [cv2.resize(f, target_size) for f in frames]
+            while len(resized_frames) < 4:
+                resized_frames.append(np.zeros_like(resized_frames[0]))
+
+            row1 = cv2.hconcat(resized_frames[:2])
+            row2 = cv2.hconcat(resized_frames[2:4])
+            combined = cv2.vconcat([row1, row2])
+            # --- Add camera labels to each quadrant ---
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.6
+            font_color = (0, 255, 255)
+            thickness = 2
+            positions = [
+                (10, 30),
+                (target_size[0] + 10, 30),
+                (10, target_size[1] + 30),
+                (target_size[0] + 10, target_size[1] + 30),
+            ]
+            labels = list(latest_frames.keys())[:4] + [""] * (4 - len(latest_frames))
+            for i, label in enumerate(labels):
+                if label:
+                    x_offset = positions[i][0]
+                    y_offset = positions[i][1]
+                    cv2.putText(combined, label, (x_offset, y_offset), font, font_scale, font_color, thickness)
+        except cv2.error:
+            time.sleep(0.05)
+            continue
+        ret, buffer = cv2.imencode('.jpg', combined)
         frame_bytes = buffer.tobytes()
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
@@ -482,8 +517,7 @@ def start_pipeline():
                     continue
 
                 frame = in_cam.getCvFrame()
-                global latest_frame
-                latest_frame = frame
+                latest_frames[active["name"]] = frame
                 print(f"[DEBUG] {active['name']}: Camera frame received.")
 
                 detections = []
