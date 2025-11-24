@@ -46,7 +46,7 @@ def generate_frames():
             # --- Add camera labels to each quadrant ---
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 0.6
-            font_color = (0, 255, 255)
+            font_color = (0, 255, 0)
             thickness = 2
             positions = [
                 (10, 30),
@@ -570,10 +570,11 @@ def start_pipeline():
                 unique_traps_seen.update(trap_ids_in_view)
                 trap_count_label = f"Traps visible: {len(trap_ids_in_view)}"
                 unique_count_label = f"Unique traps seen: {len(unique_traps_seen)}"
+                height = frame.shape[0]
                 cv2.putText(
                     frame,
                     trap_count_label,
-                    (10, 25),
+                    (10, height - 45),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
                     (0, 255, 255),
@@ -582,7 +583,7 @@ def start_pipeline():
                 cv2.putText(
                     frame,
                     unique_count_label,
-                    (10, 55),
+                    (10, height - 15),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
                     (0, 255, 255),
