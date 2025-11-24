@@ -9,11 +9,39 @@ import cv2
 import depthai as dai
 import numpy as np
 
+# --- Flask Streaming Imports ---
+from flask import Flask, Response
+import threading
+import time
+
 print("[INFO] Starting OAK-D YOLO pipeline...")
 
 
-# Global variable to hold the latest processed frame for streaming
 latest_frame = None
+
+# --- Flask App Setup ---
+app = Flask(__name__)
+
+def generate_frames():
+    global latest_frame
+    while True:
+        if latest_frame is None:
+            time.sleep(0.1)
+            continue
+        ret, buffer = cv2.imencode('.jpg', latest_frame)
+        frame_bytes = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        time.sleep(0.05)
+
+@app.route('/video')
+def video():
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/')
+def index():
+    return '<h1>Live Stream</h1><img src="/video"/>'
 
 
 def load_config(config_path: Path) -> dict[str, Any]:
@@ -387,12 +415,12 @@ def create_device_context(pipeline_obj: dai.Pipeline, device_info: dai.DeviceInf
         if device is not None:
             device.close()
 
-if __name__ == "__main__":
+
+# --- Pipeline Thread Function ---
+def start_pipeline():
     camera_setups = [
         CameraSetup(name="camera_1_left", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
         CameraSetup(name="camera_2_right", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
-        #CameraSetup(name="camera_3_front", blob_path="my_blobs/alternate_model_a.blob"),
-        #CameraSetup(name="camera_4_back", blob_path="my_blobs/alternate_model_b.blob"),
     ]
 
     pipeline_bundles: list[PipelineBundle] = []
@@ -454,6 +482,7 @@ if __name__ == "__main__":
                     continue
 
                 frame = in_cam.getCvFrame()
+                global latest_frame
                 latest_frame = frame
                 print(f"[DEBUG] {active['name']}: Camera frame received.")
 
@@ -469,7 +498,7 @@ if __name__ == "__main__":
 
                 for det in detections:
                     if det.confidence < 0.3:
-                        continue  # Ignore low confidence
+                        continue
 
                     x1 = int(det.xmin * frame.shape[1])
                     y1 = int(det.ymin * frame.shape[0])
@@ -526,10 +555,7 @@ if __name__ == "__main__":
                     )
                     print("[ACTION] Turn Off systems")
                     print(f"[METRIC] Unique traps seen so far: {len(unique_traps_seen)}")
-                # cv2.imshow(active["window"], frame)  # Disabled for headless/web streaming
 
-            # if cv2.waitKey(1) == ord("q"):
-            #     running = False
-
-    # cv2.destroyAllWindows()
-    print("[INFO] Exiting pipeline.")
+if __name__ == "__main__":
+    threading.Thread(target=start_pipeline, daemon=True).start()
+    app.run(host='0.0.0.0', port=5000, threaded=True)
