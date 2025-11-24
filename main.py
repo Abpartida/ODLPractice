@@ -172,6 +172,10 @@ TRAP_REGISTRY: dict[int, dict[str, str]] = {
 
 use_xlink = hasattr(dai.node, "XLinkOut")
 
+# Primary blob must always be available; secondary blob serves optional cameras.
+PRIMARY_BLOB_PATH = Path("my_blobs/best.rvc2_legacy.rvc2/best.blob")
+SECONDARY_BLOB_PATH = Path("my_blobs/best_openvino_2022.1_6shave.blob")
+
 
 @dataclass
 class CameraSetup:
@@ -192,6 +196,47 @@ class PipelineBundle:
     pipeline: dai.Pipeline
     host_outputs: dict[str, dai.Node.Output]
     streams: dict[str, str]
+
+
+
+def create_yolo_pipeline_nodes(
+    pipeline: dai.Pipeline, model_config: dict[str, Any], blob_path: str, input_dim: tuple[int, int]
+) -> tuple[dai.Node.Output, dai.Node.Output]:
+    """Configure the ColorCamera + YoloDetectionNetwork graph from the working script."""
+    nn_config = model_config.get("nn_config", {})
+    metadata = nn_config.get("NN_specific_metadata", {})
+
+    classes = int(metadata.get("classes", len(label_map)))
+    coordinates = int(metadata.get("coordinates", 4))
+    anchors = metadata.get("anchors", []) or []
+    anchor_masks = metadata.get("anchor_masks", {}) or {}
+    iou_threshold = float(metadata.get("iou_threshold", 0.5))
+    confidence_threshold = float(metadata.get("confidence_threshold", 0.5))
+
+    input_width, input_height = input_dim
+
+    cam_rgb = pipeline.create(dai.node.ColorCamera)
+    cam_rgb.setPreviewSize(input_width, input_height)
+    cam_rgb.setInterleaved(False)
+    cam_rgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
+    cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+    cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+
+    detection_network = pipeline.create(dai.node.YoloDetectionNetwork)
+    detection_network.setConfidenceThreshold(confidence_threshold)
+    detection_network.setNumClasses(classes)
+    detection_network.setCoordinateSize(coordinates)
+    if anchors:
+        detection_network.setAnchors(anchors)
+    if anchor_masks:
+        detection_network.setAnchorMasks(anchor_masks)
+    detection_network.setIouThreshold(iou_threshold)
+    detection_network.setBlobPath(blob_path)
+    detection_network.setNumInferenceThreads(2)
+    detection_network.input.setBlocking(False)
+
+    cam_rgb.preview.link(detection_network.input)
+    return detection_network.passthrough, detection_network.out
 
 
 def create_yolo_pipeline_nodes(
@@ -270,6 +315,7 @@ def build_pipeline(setup: CameraSetup) -> PipelineBundle:
         pipeline=pipeline,
         host_outputs=host_outputs,
         streams=stream_names,
+        blob_path=blob_path,
     )
 
 
@@ -363,6 +409,19 @@ if len(available_devices) < len(pipeline_bundles):
     )
 
 active_pairs = list(zip(pipeline_bundles, available_devices))
+if not active_pairs:
+    raise RuntimeError("[ERROR] Unable to pair pipelines with available devices.")
+
+primary_blob_resolved = str(PRIMARY_BLOB_PATH.resolve())
+primary_connected = any(bundle.blob_path == primary_blob_resolved for bundle, _ in active_pairs)
+if not primary_connected:
+    raise RuntimeError(
+        "[ERROR] At least one connected camera must run the primary blob "
+        f"({PRIMARY_BLOB_PATH}). Ensure a primary camera is connected."
+    )
+print(
+    f"[INFO] Activating {len(active_pairs)} of {len(pipeline_bundles)} configured camera pipeline(s)."
+)
 
 active_devices = []
 with ExitStack() as stack:
