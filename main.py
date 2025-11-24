@@ -416,12 +416,17 @@ def annotate_traps(frame: np.ndarray, trap_detections: list[dict[str, Any]], cam
         center = corners.mean(axis=0).astype(int)
         label = f"{detection['trap_name']} (ID {detection['marker_id']})"
         location = detection["location"]
-        # Place the trap label and location in the bottom-left corner of the frame
-        cv2.putText(frame, label, (10, frame.shape[0] - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Place the trap label and location anchored to the bottom-left corner of the marker
+        # Find the bottom-left corner: the corner with the largest y value (lowest), if tie, smallest x
+        # corners shape: (4,2)
+        bl_idx = corners[:, 1].argmax()
+        bottom_left = tuple(corners[bl_idx])
+        x_bl, y_bl = int(bottom_left[0]), int(bottom_left[1])
+        cv2.putText(frame, label, (x_bl, y_bl - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         cv2.putText(
             frame,
             location,
-            (10, frame.shape[0] - 20),
+            (x_bl, y_bl),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
             (255, 255, 155),
