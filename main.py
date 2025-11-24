@@ -12,6 +12,10 @@ import numpy as np
 print("[INFO] Starting OAK-D YOLO pipeline...")
 
 
+# Global variable to hold the latest processed frame for streaming
+latest_frame = None
+
+
 def load_config(config_path: Path) -> dict[str, Any]:
     with open(config_path, "r", encoding="utf-8") as config_file:
         return json.load(config_file)
@@ -449,6 +453,7 @@ with ExitStack() as stack:
                 continue
 
             frame = in_cam.getCvFrame()
+            latest_frame = frame
             print(f"[DEBUG] {active['name']}: Camera frame received.")
 
             detections = []

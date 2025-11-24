@@ -1,21 +1,22 @@
 from flask import Flask, Response
 import cv2
+import time
+
+# IMPORTANT: import the global frame from main
+from main import latest_frame
 
 app = Flask(__name__)
 
-# Adjust this path or method to get your latest processed frame
 def generate_frames():
-    cap = cv2.VideoCapture(0)  # Change this to your OAK-D frame grabber if needed
     while True:
-        success, frame = cap.read()
-        if not success:
-            break
-
-        ret, buffer = cv2.imencode('.jpg', frame)
+        if latest_frame is None:
+            time.sleep(0.1)
+            continue
+        ret, buffer = cv2.imencode('.jpg', latest_frame)
         frame_bytes = buffer.tobytes()
-
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        time.sleep(0.05)  # ~20 FPS
 
 @app.route('/video')
 def video():
