@@ -462,6 +462,8 @@ def start_pipeline():
     camera_setups = [
         CameraSetup(name="camera_1_left", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
         CameraSetup(name="camera_2_right", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
+        #CameraSetup(name="camera_3_front", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
+        #CameraSetup(name="camera_4_back", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
     ]
 
     pipeline_bundles: list[PipelineBundle] = []
