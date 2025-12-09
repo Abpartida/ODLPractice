@@ -11,7 +11,74 @@ import cv2
 import depthai as dai
 import numpy as np
 
+# --- Flask Streaming Imports ---
+from flask import Flask, Response
+import threading
+import time
+
 print("[INFO] Starting OAK-D YOLO pipeline...")
+
+
+latest_frames = {}
+
+# --- Flask App Setup ---
+app = Flask(__name__)
+
+def generate_frames():
+    global latest_frames
+    while True:
+        if not latest_frames:
+            time.sleep(0.1)
+            continue
+        try:
+            frames = [f for f in latest_frames.values() if f is not None]
+            if not frames:
+                time.sleep(0.1)
+                continue
+
+            # Resize all frames to the size of the first frame
+            target_size = (frames[0].shape[1], frames[0].shape[0])
+            resized_frames = [cv2.resize(f, target_size) for f in frames]
+            while len(resized_frames) < 4:
+                resized_frames.append(np.zeros_like(resized_frames[0]))
+
+            row1 = cv2.hconcat(resized_frames[:2])
+            row2 = cv2.hconcat(resized_frames[2:4])
+            combined = cv2.vconcat([row1, row2])
+            # --- Add camera labels to each quadrant ---
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.6
+            font_color = (0, 255, 0)
+            thickness = 2
+            positions = [
+                (10, 30),
+                (target_size[0] + 10, 30),
+                (10, target_size[1] + 30),
+                (target_size[0] + 10, target_size[1] + 30),
+            ]
+            labels = list(latest_frames.keys())[:4] + [""] * (4 - len(latest_frames))
+            for i, label in enumerate(labels):
+                if label:
+                    x_offset = positions[i][0]
+                    y_offset = positions[i][1]
+                    cv2.putText(combined, label, (x_offset, y_offset), font, font_scale, font_color, thickness)
+        except cv2.error:
+            time.sleep(0.05)
+            continue
+        ret, buffer = cv2.imencode('.jpg', combined)
+        frame_bytes = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        time.sleep(0.05)
+
+@app.route('/video')
+def video():
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/')
+def index():
+    return '<h1>Live Stream</h1><img src="/video"/>'
 
 
 def load_config(config_path: Path) -> dict[str, Any]:
@@ -351,14 +418,20 @@ def annotate_traps(frame: np.ndarray, trap_detections: list[dict[str, Any]], cam
         center = corners.mean(axis=0).astype(int)
         label = f"{detection['trap_name']} (ID {detection['marker_id']})"
         location = detection["location"]
-        cv2.putText(frame, label, tuple(center), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Place the trap label and location anchored to the bottom-left corner of the marker
+        # Find the bottom-left corner: the corner with the largest y value (lowest), if tie, smallest x
+        # corners shape: (4,2)
+        bl_idx = corners[:, 1].argmax()
+        bottom_left = tuple(corners[bl_idx])
+        x_bl, y_bl = int(bottom_left[0]), int(bottom_left[1])
+        cv2.putText(frame, label, (x_bl, y_bl - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         cv2.putText(
             frame,
             location,
-            (center[0], center[1] + 15),
+            (x_bl, y_bl),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
-            (255, 255, 255),
+            (255, 255, 155),
             1,
         )
         print(
@@ -371,195 +444,167 @@ def annotate_traps(frame: np.ndarray, trap_detections: list[dict[str, Any]], cam
 def create_device_context(pipeline_obj: dai.Pipeline, device_info: dai.DeviceInfo | None = None):
     device = None
     try:
+        import time
+        time.sleep(2)
         if device_info is None:
             device = dai.Device(pipeline_obj)
         else:
             try:
-                device = dai.Device(device_info, usbSpeed=dai.UsbSpeed.SUPER)
+                device = dai.Device(pipeline_obj, device_info, dai.UsbSpeed.SUPER)
             except TypeError:
-                device = dai.Device(device_info)
-            if hasattr(device, "startPipeline"):
-                device.startPipeline(pipeline_obj)
+                device = dai.Device(pipeline_obj, device_info)
         yield device
     finally:
         if device is not None:
             device.close()
 
-camera_setups = [
-    CameraSetup(name="camera_1_left", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
-    CameraSetup(name="camera_2_right", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
-    #CameraSetup(name="camera_3_front", blob_path="my_blobs/alternate_model_a.blob"),
-    #CameraSetup(name="camera_4_back", blob_path="my_blobs/alternate_model_b.blob"),
-]
 
-pipeline_bundles: list[PipelineBundle] = []
-for setup in camera_setups:
-    bundle = build_pipeline(setup)
-    pipeline_bundles.append(bundle)
+# --- Pipeline Thread Function ---
+def start_pipeline():
+    camera_setups = [
+        CameraSetup(name="camera_1_left", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
+        CameraSetup(name="camera_2_right", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
+        #CameraSetup(name="camera_3_front", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
+        #CameraSetup(name="camera_4_back", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
+    ]
 
-available_devices = dai.Device.getAllAvailableDevices()
-if not available_devices:
-    raise RuntimeError("[ERROR] No DepthAI devices detected.")
+    pipeline_bundles: list[PipelineBundle] = []
+    for setup in camera_setups:
+        bundle = build_pipeline(setup)
+        pipeline_bundles.append(bundle)
 
-if len(available_devices) < len(pipeline_bundles):
-    print(
-        f"[WARN] Requested {len(pipeline_bundles)} camera(s) but only "
-        f"{len(available_devices)} device(s) detected. Proceeding with available devices."
-    )
+    available_devices = dai.Device.getAllAvailableDevices()
+    if not available_devices:
+        raise RuntimeError("[ERROR] No DepthAI devices detected.")
 
-active_pairs = list(zip(pipeline_bundles, available_devices))
-if not active_pairs:
-    raise RuntimeError("[ERROR] Unable to pair pipelines with available devices.")
-
-print(f"[INFO] Activating {len(active_pairs)} of {len(pipeline_bundles)} configured camera pipeline(s).")
-
-active_devices = []
-with ExitStack() as stack:
-    for bundle, device_info in active_pairs:
-        device = stack.enter_context(create_device_context(bundle.pipeline, device_info))
-        print(f"[INFO] Connected to {bundle.setup.name} (MXID: {device.getMxId()})")
-
-        if use_xlink:
-            q_nn = device.getOutputQueue(bundle.streams["nn"], maxSize=4, blocking=False)
-            q_cam = device.getOutputQueue(bundle.streams["cam"], maxSize=4, blocking=False)
-        else:
-            q_nn = bundle.host_outputs["nn"].createOutputQueue(maxSize=4, blocking=False)
-            q_cam = bundle.host_outputs["cam"].createOutputQueue(maxSize=4, blocking=False)
-
-        if q_nn is None or q_cam is None:
-            raise RuntimeError(f"[ERROR] Output queues not initialized for {bundle.setup.name}.")
-        active_devices.append(
-            {
-                "name": bundle.setup.name,
-                "nn_queue": q_nn,
-                "cam_queue": q_cam,
-                "window": f"{bundle.setup.name} Inference",
-                "visible_traps": set(),
-            }
+    if len(available_devices) < len(pipeline_bundles):
+        print(
+            f"[WARN] Requested {len(pipeline_bundles)} camera(s) but only "
+            f"{len(available_devices)} device(s) detected. Proceeding with available devices."
         )
 
-    if not active_devices:
-        raise RuntimeError("[ERROR] No active devices configured.")
+    active_pairs = list(zip(pipeline_bundles, available_devices))
+    if not active_pairs:
+        raise RuntimeError("[ERROR] Unable to pair pipelines with available devices.")
 
-    print("[INFO] Output queues initialized for all cameras.")
-    unique_traps_seen: set[int] = set()
-    log_file_path = "detections_log.csv"
-    with open(log_file_path, mode='w', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow(["timestamp", "camera", "label", "confidence", "x1", "y1", "x2", "y2", "trap_id", "trap_name", "trap_location"])
-    running = True
-    while running:
-        for active in active_devices:
-            in_cam = active["cam_queue"].tryGet()
-            if in_cam is None:
+    print(f"[INFO] Activating {len(active_pairs)} of {len(pipeline_bundles)} configured camera pipeline(s).")
+
+    active_devices = []
+    with ExitStack() as stack:
+        for bundle, device_info in active_pairs:
+            try:
+                device = stack.enter_context(create_device_context(bundle.pipeline, device_info))
+            except RuntimeError as e:
+                print(f"[WARNING] Skipping camera '{bundle.setup.name}' due to error: {e}")
                 continue
+            print(f"[INFO] Connected to {bundle.setup.name} (MXID: {device.getMxId()})")
 
-            frame = in_cam.getCvFrame()
-            print(f"[DEBUG] {active['name']}: Camera frame received.")
+            if use_xlink:
+                q_nn = device.getOutputQueue(bundle.streams["nn"], maxSize=4, blocking=False)
+                q_cam = device.getOutputQueue(bundle.streams["cam"], maxSize=4, blocking=False)
+            else:
+                q_nn = bundle.host_outputs["nn"].createOutputQueue(maxSize=4, blocking=False)
+                q_cam = bundle.host_outputs["cam"].createOutputQueue(maxSize=4, blocking=False)
 
-            detections = []
-            in_nn = active["nn_queue"].tryGet()
-            if in_nn is not None:
-                print(f"[DEBUG] {active['name']}: NN packet type: {type(in_nn)}")
-                if hasattr(in_nn, "detections"):
-                    detections = in_nn.detections
-                    print(f"[INFO] {active['name']}: {len(detections)} detections received.")
-                else:
-                    print(f"[WARN] {active['name']}: No 'detections' attribute in NN output.")
+            if q_nn is None or q_cam is None:
+                raise RuntimeError(f"[ERROR] Output queues not initialized for {bundle.setup.name}.")
+            active_devices.append(
+                {
+                    "name": bundle.setup.name,
+                    "nn_queue": q_nn,
+                    "cam_queue": q_cam,
+                    "window": f"{bundle.setup.name} Inference",
+                    "visible_traps": set(),
+                }
+            )
 
-            trap_detections = detect_pest_traps(frame)
+        if not active_devices:
+            raise RuntimeError("[ERROR] No active devices configured.")
 
-            for det in detections:
-                if det.confidence < 0.3:
-                    continue  # Ignore low confidence
+        print("[INFO] Output queues initialized for all cameras.")
+        unique_traps_seen: set[int] = set()
+        running = True
+        while running:
+            for active in active_devices:
+                in_cam = active["cam_queue"].tryGet()
+                if in_cam is None:
+                    continue
 
-                x1 = int(det.xmin * frame.shape[1])
-                y1 = int(det.ymin * frame.shape[0])
-                x2 = int(det.xmax * frame.shape[1])
-                y2 = int(det.ymax * frame.shape[0])
-                label = label_map[det.label] if det.label < len(label_map) else f"ID:{det.label}"
-                confidence = det.confidence
+                frame = in_cam.getCvFrame()
+                latest_frames[active["name"]] = frame
+                print(f"[DEBUG] {active['name']}: Camera frame received.")
 
-                print(
-                    f"[DEBUG] {active['name']}: Detected {label} ({confidence:.2f}) "
-                    f"at [{x1},{y1},{x2},{y2}]"
-                )
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                detections = []
+                in_nn = active["nn_queue"].tryGet()
+                if in_nn is not None:
+                    print(f"[DEBUG] {active['name']}: NN packet type: {type(in_nn)}")
+                    if hasattr(in_nn, "detections"):
+                        detections = in_nn.detections
+                        print(f"[INFO] {active['name']}: {len(detections)} detections received.")
+                    else:
+                        print(f"[WARN] {active['name']}: No 'detections' attribute in NN output.")
+
+                for det in detections:
+                    if det.confidence < 0.3:
+                        continue
+
+                    x1 = int(det.xmin * frame.shape[1])
+                    y1 = int(det.ymin * frame.shape[0])
+                    x2 = int(det.xmax * frame.shape[1])
+                    y2 = int(det.ymax * frame.shape[0])
+                    label = label_map[det.label] if det.label < len(label_map) else f"ID:{det.label}"
+                    confidence = det.confidence
+
+                    print(
+                        f"[DEBUG] {active['name']}: Detected {label} ({confidence:.2f}) "
+                        f"at [{x1},{y1},{x2},{y2}]"
+                    )
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(
+                        frame,
+                        f"{label} {confidence:.2f}",
+                        (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (255, 255, 255),
+                        1,
+                    )
+
+                trap_detections = detect_pest_traps(frame)
+                if trap_detections:
+                    annotate_traps(frame, trap_detections, active["name"])
+                trap_ids_in_view = {detection["marker_id"] for detection in trap_detections}
+                active["visible_traps"] = trap_ids_in_view
+                unique_traps_seen.update(trap_ids_in_view)
+                trap_count_label = f"Traps visible: {len(trap_ids_in_view)}"
+                unique_count_label = f"Unique traps seen: {len(unique_traps_seen)}"
+                height = frame.shape[0]
                 cv2.putText(
                     frame,
-                    f"{label} {confidence:.2f}",
-                    (x1, y1 - 10),
+                    trap_count_label,
+                    (10, height - 45),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (255, 255, 255),
-                    1,
+                    0.7,
+                    (0, 255, 255),
+                    2,
                 )
-
-                # Logging detection to CSV
-                timestamp = datetime.now().isoformat()
-                trap_info = {"marker_id": None, "name": "", "location": ""}
-                for det_trap in trap_detections:
-                    if (x1 >= det_trap["corners"][:,0].min() and x2 <= det_trap["corners"][:,0].max() and
-                        y1 >= det_trap["corners"][:,1].min() and y2 <= det_trap["corners"][:,1].max()):
-                        trap_info = {
-                            "marker_id": det_trap["marker_id"],
-                            "name": det_trap["trap_name"],
-                            "location": det_trap["location"]
-                        }
-                        break
-
-                with open(log_file_path, mode='a', newline='') as file:
-                    writer = csv.writer(file)
-                    writer.writerow([
-                        timestamp,
-                        active["name"],
-                        label,
-                        f"{confidence:.2f}",
-                        x1,
-                        y1,
-                        x2,
-                        y2,
-                        trap_info["marker_id"],
-                        trap_info["name"],
-                        trap_info["location"]
-                    ])
-
-            if trap_detections:
-                annotate_traps(frame, trap_detections, active["name"])
-            trap_ids_in_view = {detection["marker_id"] for detection in trap_detections}
-            active["visible_traps"] = trap_ids_in_view
-            unique_traps_seen.update(trap_ids_in_view)
-            trap_count_label = f"Traps visible: {len(trap_ids_in_view)}"
-            unique_count_label = f"Unique traps seen: {len(unique_traps_seen)}"
-            cv2.putText(
-                frame,
-                trap_count_label,
-                (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
-                2,
-            )
-            cv2.putText(
-                frame,
-                unique_count_label,
-                (10, 55),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
-                2,
-            )
-            if trap_ids_in_view:
-                print(
-                    f"[INFO] {active['name']}: Currently viewing {len(trap_ids_in_view)} trap(s): "
-                    f"{sorted(trap_ids_in_view)}"
+                cv2.putText(
+                    frame,
+                    unique_count_label,
+                    (10, height - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255),
+                    2,
                 )
-                print("[ACTION] Turn Off systems")
-                print(f"[METRIC] Unique traps seen so far: {len(unique_traps_seen)}")
-            cv2.imshow(active["window"], frame)
+                if trap_ids_in_view:
+                    print(
+                        f"[INFO] {active['name']}: Currently viewing {len(trap_ids_in_view)} trap(s): "
+                        f"{sorted(trap_ids_in_view)}"
+                    )
+                    print("[ACTION] Turn Off systems")
+                    print(f"[METRIC] Unique traps seen so far: {len(unique_traps_seen)}")
 
-        if cv2.waitKey(1) == ord("q"):
-            running = False
-
-cv2.destroyAllWindows()
-print("[INFO] Exiting pipeline.")
+if __name__ == "__main__":
+    threading.Thread(target=start_pipeline, daemon=True).start()
+    app.run(host='0.0.0.0', port=5000, threaded=True)
