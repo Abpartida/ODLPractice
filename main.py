@@ -442,15 +442,15 @@ def annotate_traps(frame: np.ndarray, trap_detections: list[dict[str, Any]], cam
 def create_device_context(pipeline_obj: dai.Pipeline, device_info: dai.DeviceInfo | None = None):
     device = None
     try:
+        import time
+        time.sleep(2)
         if device_info is None:
             device = dai.Device(pipeline_obj)
         else:
             try:
-                device = dai.Device(device_info, usbSpeed=dai.UsbSpeed.SUPER)
+                device = dai.Device(pipeline_obj, device_info, dai.UsbSpeed.SUPER)
             except TypeError:
-                device = dai.Device(device_info)
-            if hasattr(device, "startPipeline"):
-                device.startPipeline(pipeline_obj)
+                device = dai.Device(pipeline_obj, device_info)
         yield device
     finally:
         if device is not None:
@@ -490,7 +490,11 @@ def start_pipeline():
     active_devices = []
     with ExitStack() as stack:
         for bundle, device_info in active_pairs:
-            device = stack.enter_context(create_device_context(bundle.pipeline, device_info))
+            try:
+                device = stack.enter_context(create_device_context(bundle.pipeline, device_info))
+            except RuntimeError as e:
+                print(f"[WARNING] Skipping camera '{bundle.setup.name}' due to error: {e}")
+                continue
             print(f"[INFO] Connected to {bundle.setup.name} (MXID: {device.getMxId()})")
 
             if use_xlink:
