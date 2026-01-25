@@ -1,3 +1,7 @@
+#26008 LYCO TOMI 
+This is the main repository for the pest identification software for the LYCO TOMI system. Below is the documentation on how to set up, run, and test the pest ident system.
+
+
 ## How to set up the environment
 ```bash
 /opt/homebrew/bin/python3.10 -m venv venv310
