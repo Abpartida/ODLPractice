@@ -10,7 +10,8 @@ import depthai as dai
 import numpy as np
 
 # --- Flask Streaming Imports ---
-from flask import Flask, Response
+from flask import Flask, Response, request, jsonify
+import requests
 import threading
 import time
 
@@ -21,6 +22,27 @@ latest_frames = {}
 
 # --- Flask App Setup ---
 app = Flask(__name__)
+
+# --- Arduino App Setup ---
+ESP32_BASE_URL = os.environ.get("ESP32_BASE_URL", "http://192.168.1.123")  # change to your ESP32 IP
+ESP32_TIMEOUT_SEC = float(os.environ.get("ESP32_TIMEOUT_SEC", "0.5"))
+
+def esp32_send(cmd: str) -> tuple[bool, str]:
+    """
+    Sends command to ESP32 endpoint: /cmd?c=<CMD>
+    Returns (ok, reply_text).
+    """
+    try:
+        r = requests.get(
+            f"{ESP32_BASE_URL}/cmd",
+            params={"c": cmd},
+            timeout=ESP32_TIMEOUT_SEC,
+        )
+        if r.status_code == 200:
+            return True, r.text.strip()
+        return False, f"ESP32 HTTP {r.status_code}: {r.text}"
+    except requests.RequestException as e:
+        return False, f"ESP32 error: {e}"
 
 def generate_frames():
     global latest_frames
@@ -68,6 +90,32 @@ def generate_frames():
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
         time.sleep(0.05)
+
+# --- Arduino App Endpoints ---
+@app.post("/api/lift/up")
+def api_lift_up():
+    ok, reply = esp32_send("LIFT_UP")
+    return (jsonify(ok=ok, reply=reply), 200 if ok else 502)
+
+@app.post("/api/lift/down")
+def api_lift_down():
+    ok, reply = esp32_send("LIFT_DOWN")
+    return (jsonify(ok=ok, reply=reply), 200 if ok else 502)
+
+@app.post("/api/lift/stop")
+def api_lift_stop():
+    ok, reply = esp32_send("LIFT_STOP")
+    return (jsonify(ok=ok, reply=reply), 200 if ok else 502)
+
+@app.post("/api/fan/on")
+def api_fan_on():
+    ok, reply = esp32_send("FAN_ON")
+    return (jsonify(ok=ok, reply=reply), 200 if ok else 502)
+
+@app.post("/api/fan/off")
+def api_fan_off():
+    ok, reply = esp32_send("FAN_OFF")
+    return (jsonify(ok=ok, reply=reply), 200 if ok else 502)
 
 @app.route('/video')
 def video():
