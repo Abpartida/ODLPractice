@@ -106,7 +106,7 @@ def resolve_model_artifacts(result_dir: Path) -> tuple[Path, Path]:
     return _pick_preferred(blob_files), _pick_preferred(json_files)
 
 
-RESULT_DIR = Path(os.environ.get("RESULT_DIR", "my_blobs/pestv5"))
+RESULT_DIR = Path(os.environ.get("RESULT_DIR", "my_blobs/pestv5feb"))
 MODEL_CONFIG: dict[str, Any] | None = None
 DEFAULT_MODEL_BLOB: Path | None = None
 label_map: list[str] = []
@@ -459,11 +459,15 @@ def create_device_context(pipeline_obj: dai.Pipeline, device_info: dai.DeviceInf
 
 # --- Pipeline Thread Function ---
 def start_pipeline():
+    if DEFAULT_MODEL_BLOB is None:
+        raise RuntimeError("DEFAULT_MODEL_BLOB is not set; ensure RESULT_DIR points to a valid export.")
+
+    model_blob_path = str(DEFAULT_MODEL_BLOB)
     camera_setups = [
-        CameraSetup(name="camera_1_left", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
-        CameraSetup(name="camera_2_right", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
-        #CameraSetup(name="camera_3_front", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
-        #CameraSetup(name="camera_4_back", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
+        CameraSetup(name="camera_1_left", blob_path=model_blob_path),
+        CameraSetup(name="camera_2_right", blob_path=model_blob_path),
+        #CameraSetup(name="camera_3_front", blob_path=model_blob_path),
+        #CameraSetup(name="camera_4_back", blob_path=model_blob_path),
     ]
 
     pipeline_bundles: list[PipelineBundle] = []
