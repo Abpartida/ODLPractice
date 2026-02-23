@@ -1,6 +1,6 @@
 import serial, time
 
-PORT = "/dev/pts/4"   # <-- the OTHER end of the socat pair
+PORT = "/dev/ttys004"   # <-- the OTHER end of the socat pair
 BAUD = 115200
 
 state = {"m": [0,0,0,0], "v": 0}
@@ -38,6 +38,7 @@ last_stat = 0.0
 while True:
     line = ser.readline().decode(errors="ignore")
     if line:
+        print("ESP32 RECEIVED:", line)
         resp = handle(line)
         if resp:
             ser.write(resp.encode())

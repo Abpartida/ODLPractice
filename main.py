@@ -1,3 +1,10 @@
+##Note from 2/16/26 on the Pi install pyserial 
+## pip install pyserial
+## and set port
+## export SERIAL_PORT=/dev/ttyACM0
+## export SERIAL_BAUD=115200
+## python3 main.py
+## If your ESP32 shows up as /dev/ttyUSB0, use that instead.
 import json
 import os
 from contextlib import ExitStack, contextmanager
@@ -15,6 +22,9 @@ import requests
 import threading
 import time
 
+import serial
+from serial import SerialException
+
 print("[INFO] Starting OAK-D YOLO pipeline...")
 
 
@@ -23,26 +33,118 @@ latest_frames = {}
 # --- Flask App Setup ---
 app = Flask(__name__)
 
-# --- Arduino App Setup ---
-ESP32_BASE_URL = os.environ.get("ESP32_BASE_URL", "http://192.168.1.123")  # change to your ESP32 IP
-ESP32_TIMEOUT_SEC = float(os.environ.get("ESP32_TIMEOUT_SEC", "0.5"))
+# --- Arduino (ESP32) Serial Setup ---
+# The ESP32 is connected to the Pi via USB serial.
+# Set SERIAL_PORT to something like: /dev/ttyACM0 or /dev/ttyUSB0 (Pi)
+SERIAL_PORT = os.environ.get("SERIAL_PORT", "/dev/ttyACM0")
+SERIAL_BAUD = int(os.environ.get("SERIAL_BAUD", "115200"))
+SERIAL_TIMEOUT_SEC = float(os.environ.get("SERIAL_TIMEOUT_SEC", "0.25"))
+
+_serial_lock = threading.Lock()
+_serial: serial.Serial | None = None
+
+
+def _open_serial() -> None:
+    global _serial
+    if _serial is not None and _serial.is_open:
+        return
+
+    try:
+        _serial = serial.Serial(
+            port=SERIAL_PORT,
+            baudrate=SERIAL_BAUD,
+            timeout=SERIAL_TIMEOUT_SEC,
+            write_timeout=SERIAL_TIMEOUT_SEC,
+        )
+        # Give the board a moment if it auto-resets on open
+        time.sleep(2.3)
+        # Drain any boot text
+        try:
+            _serial.reset_input_buffer()
+        except Exception:
+            pass
+        print(f"[INFO] Serial connected: {SERIAL_PORT} @ {SERIAL_BAUD}")
+    except SerialException as e:
+        _serial = None
+        print(f"[ERROR] Failed to open serial {SERIAL_PORT}: {e}")
+
 
 def esp32_send(cmd: str) -> tuple[bool, str]:
-    """
-    Sends command to ESP32 endpoint: /cmd?c=<CMD>
+    """Send a newline-terminated command to the ESP32 over serial and read one-line reply.
+
+    ManualControl.ino expects commands like:
+      FORWARD\n, LEFT\n, RIGHT\n, STOP\n, FAN ON\n, LIFT UP\n
     Returns (ok, reply_text).
     """
-    try:
-        r = requests.get(
-            f"{ESP32_BASE_URL}/cmd",
-            params={"c": cmd},
-            timeout=ESP32_TIMEOUT_SEC,
-        )
-        if r.status_code == 200:
-            return True, r.text.strip()
-        return False, f"ESP32 HTTP {r.status_code}: {r.text}"
-    except requests.RequestException as e:
-        return False, f"ESP32 error: {e}"
+    with _serial_lock:
+        _open_serial()
+        if _serial is None or not _serial.is_open:
+            return False, "Serial not connected"
+
+        try:
+            line = (cmd.strip() + "\n").encode("utf-8")
+            _serial.write(line)
+            _serial.flush()
+
+            return True, "sent"
+
+        except (SerialException, OSError) as e:
+            try:
+                if _serial is not None:
+                    _serial.close()
+            except Exception:
+                pass
+            return False, f"Serial error: {e}"
+
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return lo if v < lo else hi if v > hi else v
+
+
+def _to_int255(v: float) -> int:
+    return int(round(_clamp(v, -1.0, 1.0) * 255.0))
+
+
+_DIRECTION_ALIAS = {
+    "forward": "FORWARD",
+    "fwd": "FORWARD",
+    "up": "FORWARD",
+    "start": "FORWARD",
+    "go": "FORWARD",
+    "left": "LEFT",
+    "right": "RIGHT",
+    "stop": "STOP",
+    "halt": "STOP",
+    "idle": "STOP",
+}
+
+JOYSTICK_DEADZONE = float(os.environ.get("JOYSTICK_DEADZONE", "0.3"))
+
+
+def _command_from_direction(direction: Any) -> str | None:
+    if not isinstance(direction, str):
+        return None
+    normalized = direction.strip().lower()
+    if not normalized:
+        return None
+    return _DIRECTION_ALIAS.get(normalized)
+
+
+def _command_from_axes(x: float, y: float) -> str:
+    """Map analog joystick axes to discrete FORWARD/LEFT/RIGHT/STOP commands."""
+    magnitude = max(abs(x), abs(y))
+    if magnitude < JOYSTICK_DEADZONE:
+        return "STOP"
+
+    # Prioritize forward motion when pushing mostly up on the stick.
+    if abs(y) >= abs(x) and y > 0:
+        return "FORWARD"
+
+    # No backward command is supported in the new firmware; fall back to stop.
+    if abs(y) >= abs(x) and y <= 0:
+        return "STOP"
+
+    return "RIGHT" if x > 0 else "LEFT"
 
 def generate_frames():
     global latest_frames
@@ -91,30 +193,79 @@ def generate_frames():
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
         time.sleep(0.05)
 
+#
+# --- Auth (Android app expects this) ---
+@app.post("/auth/login")
+def auth_login():
+    # This is a minimal stub for development/testing.
+    # Replace with real auth if/when needed.
+    return jsonify(access_token="dev-token", token_type="bearer", expires_in=3600), 200
+
+
+@app.get("/status")
+def status():
+    ok, reply = esp32_send("STAT?")
+    return (jsonify(system_status="Nominal" if ok else "Degraded", serial=reply), 200 if ok else 502)
+
+
+@app.post("/api/drive/joystick")
+def api_drive_joystick():
+    data = request.get_json(silent=True) or {}
+
+    # Preferred payload from your app/fake server:
+    #   {"direction":"Forward"}
+    direction = data.get("direction")
+    cmd = _command_from_direction(direction)
+    if cmd:
+        ok, reply = esp32_send(cmd)
+        return (jsonify(status="ok" if ok else "err", cmd=cmd, serial=reply), 200 if ok else 502)
+
+    # Optional analog payload:
+    #   {"x":0.1,"y":0.8}  or {"horizontal":...,"vertical":...}
+    x = data.get("x", data.get("horizontal", 0.0))
+    y = data.get("y", data.get("vertical", 0.0))
+
+    try:
+        x_f = float(x)
+        y_f = float(y)
+    except (TypeError, ValueError):
+        return jsonify(error="bad joystick payload"), 400
+
+    cmd = _command_from_axes(x_f, y_f)
+    ok, reply = esp32_send(cmd)
+    return (jsonify(status="ok" if ok else "err", cmd=cmd, serial=reply), 200 if ok else 502)
+
+
+@app.post("/api/drive/stop")
+def api_drive_stop():
+    ok, reply = esp32_send("STOP")
+    return (jsonify(status="stopped" if ok else "err", serial=reply), 200 if ok else 502)
+
+
 # --- Arduino App Endpoints ---
 @app.post("/api/lift/up")
 def api_lift_up():
-    ok, reply = esp32_send("LIFT_UP")
+    ok, reply = esp32_send("LIFT UP")
     return (jsonify(ok=ok, reply=reply), 200 if ok else 502)
 
 @app.post("/api/lift/down")
 def api_lift_down():
-    ok, reply = esp32_send("LIFT_DOWN")
+    ok, reply = esp32_send("LIFT DOWN")
     return (jsonify(ok=ok, reply=reply), 200 if ok else 502)
 
 @app.post("/api/lift/stop")
 def api_lift_stop():
-    ok, reply = esp32_send("LIFT_STOP")
+    ok, reply = esp32_send("LIFT STOP")
     return (jsonify(ok=ok, reply=reply), 200 if ok else 502)
 
 @app.post("/api/fan/on")
 def api_fan_on():
-    ok, reply = esp32_send("FAN_ON")
+    ok, reply = esp32_send("FAN ON")
     return (jsonify(ok=ok, reply=reply), 200 if ok else 502)
 
 @app.post("/api/fan/off")
 def api_fan_off():
-    ok, reply = esp32_send("FAN_OFF")
+    ok, reply = esp32_send("FAN OFF")
     return (jsonify(ok=ok, reply=reply), 200 if ok else 502)
 
 @app.route('/video')
