@@ -1,6 +1,10 @@
 import json
 import os
+<<<<<<< Updated upstream
 import csv
+=======
+import sqlite3
+>>>>>>> Stashed changes
 from datetime import datetime
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -264,47 +268,6 @@ class PipelineBundle:
     blob_path: str
 
 
-
-def create_yolo_pipeline_nodes(
-    pipeline: dai.Pipeline, model_config: dict[str, Any], blob_path: str, input_dim: tuple[int, int]
-) -> tuple[dai.Node.Output, dai.Node.Output]:
-    """Configure the ColorCamera + YoloDetectionNetwork graph from the working script."""
-    nn_config = model_config.get("nn_config", {})
-    metadata = nn_config.get("NN_specific_metadata", {})
-
-    classes = int(metadata.get("classes", len(label_map)))
-    coordinates = int(metadata.get("coordinates", 4))
-    anchors = metadata.get("anchors", []) or []
-    anchor_masks = metadata.get("anchor_masks", {}) or {}
-    iou_threshold = float(metadata.get("iou_threshold", 0.5))
-    confidence_threshold = float(metadata.get("confidence_threshold", 0.5))
-
-    input_width, input_height = input_dim
-
-    cam_rgb = pipeline.create(dai.node.ColorCamera)
-    cam_rgb.setPreviewSize(input_width, input_height)
-    cam_rgb.setInterleaved(False)
-    cam_rgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
-    cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
-    cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-
-    detection_network = pipeline.create(dai.node.YoloDetectionNetwork)
-    detection_network.setConfidenceThreshold(confidence_threshold)
-    detection_network.setNumClasses(classes)
-    detection_network.setCoordinateSize(coordinates)
-    if anchors:
-        detection_network.setAnchors(anchors)
-    if anchor_masks:
-        detection_network.setAnchorMasks(anchor_masks)
-    detection_network.setIouThreshold(iou_threshold)
-    detection_network.setBlobPath(blob_path)
-    detection_network.setNumInferenceThreads(2)
-    detection_network.input.setBlocking(False)
-
-    cam_rgb.preview.link(detection_network.input)
-    return detection_network.passthrough, detection_network.out
-
-
 def create_yolo_pipeline_nodes(
     pipeline: dai.Pipeline, model_config: dict[str, Any], blob_path: str, input_dim: tuple[int, int]
 ) -> tuple[dai.Node.Output, dai.Node.Output]:
@@ -418,9 +381,6 @@ def annotate_traps(frame: np.ndarray, trap_detections: list[dict[str, Any]], cam
         center = corners.mean(axis=0).astype(int)
         label = f"{detection['trap_name']} (ID {detection['marker_id']})"
         location = detection["location"]
-        # Place the trap label and location anchored to the bottom-left corner of the marker
-        # Find the bottom-left corner: the corner with the largest y value (lowest), if tie, smallest x
-        # corners shape: (4,2)
         bl_idx = corners[:, 1].argmax()
         bottom_left = tuple(corners[bl_idx])
         x_bl, y_bl = int(bottom_left[0]), int(bottom_left[1])
@@ -444,7 +404,6 @@ def annotate_traps(frame: np.ndarray, trap_detections: list[dict[str, Any]], cam
 def create_device_context(pipeline_obj: dai.Pipeline, device_info: dai.DeviceInfo | None = None):
     device = None
     try:
-        import time
         time.sleep(2)
         if device_info is None:
             device = dai.Device(pipeline_obj)
@@ -459,13 +418,65 @@ def create_device_context(pipeline_obj: dai.Pipeline, device_info: dai.DeviceInf
             device.close()
 
 
+# === DATABASE SETUP ===
+DB_PATH = os.environ.get("DB_PATH", "pest_results.db")
+
+
+def init_db() -> None:
+    """Initialize SQLite database with required tables."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS detections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_utc TEXT NOT NULL,
+                camera_name TEXT NOT NULL,
+                label TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                xmin INTEGER NOT NULL,
+                ymin INTEGER NOT NULL,
+                xmax INTEGER NOT NULL,
+                ymax INTEGER NOT NULL,
+                frame_w INTEGER NOT NULL,
+                frame_h INTEGER NOT NULL
+            );
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS trap_sightings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_utc TEXT NOT NULL,
+                camera_name TEXT NOT NULL,
+                marker_id INTEGER NOT NULL,
+                trap_name TEXT,
+                location TEXT
+            );
+        """)
+        conn.commit()
+        print("[INFO] Database initialized successfully.")
+
+
 # --- Pipeline Thread Function ---
 def start_pipeline():
+<<<<<<< Updated upstream
     camera_setups = [
         CameraSetup(name="camera_1_left", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
         CameraSetup(name="camera_2_right", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
         #CameraSetup(name="camera_3_front", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
         #CameraSetup(name="camera_4_back", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
+=======
+    init_db()
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    last_commit = time.time()
+
+    if DEFAULT_MODEL_BLOB is None:
+        raise RuntimeError("DEFAULT_MODEL_BLOB is not set; ensure RESULT_DIR points to a valid export.")
+
+    model_blob_path = str(DEFAULT_MODEL_BLOB)
+    camera_setups = [
+        CameraSetup(name="camera_1_left", blob_path=model_blob_path),
+        CameraSetup(name="camera_2_right", blob_path=model_blob_path),
+>>>>>>> Stashed changes
     ]
 
     pipeline_bundles: list[PipelineBundle] = []
@@ -555,6 +566,13 @@ def start_pipeline():
                     label = label_map[det.label] if det.label < len(label_map) else f"ID:{det.label}"
                     confidence = det.confidence
 
+                    ts_utc = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+                    conn.execute(
+                        "INSERT INTO detections (ts_utc, camera_name, label, confidence, xmin, ymin, xmax, ymax, frame_w, frame_h) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (ts_utc, active["name"], label, float(confidence), x1, y1, x2, y2, frame.shape[1], frame.shape[0])
+                    )
+
                     print(
                         f"[DEBUG] {active['name']}: Detected {label} ({confidence:.2f}) "
                         f"at [{x1},{y1},{x2},{y2}]"
@@ -573,6 +591,14 @@ def start_pipeline():
                 trap_detections = detect_pest_traps(frame)
                 if trap_detections:
                     annotate_traps(frame, trap_detections, active["name"])
+                    for trap_det in trap_detections:
+                        ts_utc = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+                        conn.execute(
+                            "INSERT INTO trap_sightings (ts_utc, camera_name, marker_id, trap_name, location) "
+                            "VALUES (?, ?, ?, ?, ?)",
+                            (ts_utc, active["name"], trap_det["marker_id"], trap_det["trap_name"], trap_det["location"])
+                        )
+
                 trap_ids_in_view = {detection["marker_id"] for detection in trap_detections}
                 active["visible_traps"] = trap_ids_in_view
                 unique_traps_seen.update(trap_ids_in_view)
@@ -604,6 +630,15 @@ def start_pipeline():
                     )
                     print("[ACTION] Turn Off systems")
                     print(f"[METRIC] Unique traps seen so far: {len(unique_traps_seen)}")
+
+            # COMMIT DATABASE EVERY 5 SECONDS
+            if time.time() - last_commit > 5:
+                conn.commit()
+                last_commit = time.time()
+                print("[DEBUG] Database committed.")
+
+    conn.close()
+
 
 if __name__ == "__main__":
     threading.Thread(target=start_pipeline, daemon=True).start()
