@@ -111,6 +111,9 @@ _DIRECTION_ALIAS = {
     "up": "FORWARD",
     "start": "FORWARD",
     "go": "FORWARD",
+    "back": "BACKWARD",
+    "backward": "BACKWARD",
+    "reverse": "BACKWARD",
     "left": "LEFT",
     "right": "RIGHT",
     "stop": "STOP",
@@ -136,12 +139,12 @@ def _command_from_axes(x: float, y: float) -> str:
     if magnitude < JOYSTICK_DEADZONE:
         return "STOP"
 
-    # Prioritize forward motion when pushing mostly up on the stick.
-    if abs(y) >= abs(x) and y > 0:
-        return "FORWARD"
-
-    # No backward command is supported in the new firmware; fall back to stop.
-    if abs(y) >= abs(x) and y <= 0:
+    # Prioritize straight motion when the vertical component dominates.
+    if abs(y) >= abs(x):
+        if y > 0:
+            return "FORWARD"
+        if y < 0:
+            return "BACKWARD"
         return "STOP"
 
     return "RIGHT" if x > 0 else "LEFT"
