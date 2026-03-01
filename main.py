@@ -28,7 +28,7 @@ import time
 import serial
 from serial import SerialException
 
-print("[INFO] Starting OAK-D YOLO pipeline...")
+# print("[INFO] Starting OAK-D YOLO pipeline...")
 
 
 latest_frames = {}
@@ -89,7 +89,7 @@ def _ensure_drive_worker_started() -> None:
         target=_drive_worker_loop, name="drive-serial-worker", daemon=True
     )
     _drive_worker_thread.start()
-    print("[INFO] drive-serial-worker started.")
+    # print("[INFO] drive-serial-worker started.")
 
 
 def submit_drive_command(cmd: str, deadline_sec: float | None = None) -> SerialResult | None:
@@ -141,7 +141,7 @@ def _open_serial() -> None:
             _serial.reset_input_buffer()
         except Exception:
             pass
-        print(f"[INFO] Serial connected: {SERIAL_PORT} @ {SERIAL_BAUD}")
+        # print(f"[INFO] Serial connected: {SERIAL_PORT} @ {SERIAL_BAUD}")
     except SerialException as e:
         _serial = None
         print(f"[ERROR] Failed to open serial {SERIAL_PORT}: {e}")
@@ -404,16 +404,16 @@ try:
     DEFAULT_MODEL_BLOB, MODEL_CONFIG_PATH = resolve_model_artifacts(RESULT_DIR)
     MODEL_CONFIG = load_config(MODEL_CONFIG_PATH)
     label_map = MODEL_CONFIG.get("mappings", {}).get("labels", [])
-    print(f"[INFO] Loaded model config from {MODEL_CONFIG_PATH}.")
+    # print(f"[INFO] Loaded model config from {MODEL_CONFIG_PATH}.")
 except FileNotFoundError as err:
     print(f"[WARN] {err}")
 
 if not label_map:
     with open("labels.txt", "r", encoding="utf-8") as labels_file:
         label_map = [line.strip() for line in labels_file if line.strip()]
-    print(f"[INFO] Loaded {len(label_map)} labels from labels.txt.")
+    # print(f"[INFO] Loaded {len(label_map)} labels from labels.txt.")
 else:
-    print(f"[INFO] Loaded {len(label_map)} labels from model config.")
+    # print(f"[INFO] Loaded {len(label_map)} labels from model config.")
 
 
 DEFAULT_CAMERA_DIM = (640, 640)
@@ -537,7 +537,7 @@ class CameraSetup:
     def resolved_blob_path(self) -> str:
         candidate = Path(self.blob_path)
         if candidate.exists():
-            print(f"[INFO] {self.name}: Using blob {candidate}")
+            # print(f"[INFO] {self.name}: Using blob {candidate}")
             return str(candidate)
         raise FileNotFoundError(f"{self.name}: blob not found at {self.blob_path}")
 
@@ -639,7 +639,7 @@ def build_pipeline(setup: CameraSetup) -> PipelineBundle:
     host_outputs: dict[str, dai.Node.Output] = {}
     stream_names = {"nn": f"{setup.name}_nn", "cam": f"{setup.name}_cam"}
     input_dim = determine_pipeline_input_dim(blob_path, CAMERA_PREVIEW_DIM)
-    print(f"[INFO] {setup.name}: Using input size {input_dim[0]}x{input_dim[1]}.")
+    # print(f"[INFO] {setup.name}: Using input size {input_dim[0]}x{input_dim[1]}.")
 
     if not MODEL_CONFIG:
         raise RuntimeError("MODEL_CONFIG must be available for YOLOv5 pipelines.")
@@ -647,7 +647,7 @@ def build_pipeline(setup: CameraSetup) -> PipelineBundle:
     cam_output, nn_output = create_yolo_pipeline_nodes(
         pipeline, MODEL_CONFIG, blob_path, input_dim
     )
-    print(f"[INFO] {setup.name}: Using YoloDetectionNetwork with blob {blob_path}.")
+    # print(f"[INFO] {setup.name}: Using YoloDetectionNetwork with blob {blob_path}.")
 
     if use_xlink:
         nn_xout = pipeline.create(dai.node.XLinkOut)
@@ -657,11 +657,11 @@ def build_pipeline(setup: CameraSetup) -> PipelineBundle:
         cam_xout = pipeline.create(dai.node.XLinkOut)
         cam_xout.setStreamName(stream_names["cam"])
         cam_output.link(cam_xout.input)
-        print(f"[INFO] {setup.name}: Using XLinkOut for outputs.")
+        # print(f"[INFO] {setup.name}: Using XLinkOut for outputs.")
     else:
         host_outputs["nn"] = nn_output
         host_outputs["cam"] = cam_output
-        print(f"[INFO] {setup.name}: Using host outputs.")
+        # print(f"[INFO] {setup.name}: Using host outputs.")
 
     return PipelineBundle(
         setup=setup,
@@ -721,10 +721,10 @@ def annotate_traps(frame: np.ndarray, trap_detections: list[dict[str, Any]], cam
             (255, 255, 155),
             1,
         )
-        print(
-            f"[INFO] {camera_name}: Trap '{detection['trap_name']}' (ID:{detection['marker_id']}) "
-            f"seen around {location}."
-        )
+        # print(
+        #     f"[INFO] {camera_name}: Trap '{detection['trap_name']}' (ID:{detection['marker_id']}) "
+        #     f"seen around {location}."
+        # )
 
 # Device context manager
 @contextmanager
@@ -774,7 +774,7 @@ def start_pipeline():
     if not active_pairs:
         raise RuntimeError("[ERROR] Unable to pair pipelines with available devices.")
 
-    print(f"[INFO] Activating {len(active_pairs)} of {len(pipeline_bundles)} configured camera pipeline(s).")
+    # print(f"[INFO] Activating {len(active_pairs)} of {len(pipeline_bundles)} configured camera pipeline(s).")
 
     active_devices = []
     with ExitStack() as stack:
@@ -784,7 +784,7 @@ def start_pipeline():
             except RuntimeError as e:
                 print(f"[WARNING] Skipping camera '{bundle.setup.name}' due to error: {e}")
                 continue
-            print(f"[INFO] Connected to {bundle.setup.name} (MXID: {device.getMxId()})")
+            # print(f"[INFO] Connected to {bundle.setup.name} (MXID: {device.getMxId()})")
 
             if use_xlink:
                 q_nn = device.getOutputQueue(bundle.streams["nn"], maxSize=4, blocking=False)
@@ -808,7 +808,7 @@ def start_pipeline():
         if not active_devices:
             raise RuntimeError("[ERROR] No active devices configured.")
 
-        print("[INFO] Output queues initialized for all cameras.")
+        # print("[INFO] Output queues initialized for all cameras.")
         unique_traps_seen: set[int] = set()
         running = True
         while running:
@@ -819,15 +819,15 @@ def start_pipeline():
 
                 frame = in_cam.getCvFrame()
                 latest_frames[active["name"]] = frame
-                print(f"[DEBUG] {active['name']}: Camera frame received.")
+                # print(f"[DEBUG] {active['name']}: Camera frame received.")
 
                 detections = []
                 in_nn = active["nn_queue"].tryGet()
                 if in_nn is not None:
-                    print(f"[DEBUG] {active['name']}: NN packet type: {type(in_nn)}")
+                    # print(f"[DEBUG] {active['name']}: NN packet type: {type(in_nn)}")
                     if hasattr(in_nn, "detections"):
                         detections = in_nn.detections
-                        print(f"[INFO] {active['name']}: {len(detections)} detections received.")
+                        # print(f"[INFO] {active['name']}: {len(detections)} detections received.")
                     else:
                         print(f"[WARN] {active['name']}: No 'detections' attribute in NN output.")
 
@@ -842,10 +842,10 @@ def start_pipeline():
                     label = label_map[det.label] if det.label < len(label_map) else f"ID:{det.label}"
                     confidence = det.confidence
 
-                    print(
-                        f"[DEBUG] {active['name']}: Detected {label} ({confidence:.2f}) "
-                        f"at [{x1},{y1},{x2},{y2}]"
-                    )
+                    # print(
+                    #     f"[DEBUG] {active['name']}: Detected {label} ({confidence:.2f}) "
+                    #     f"at [{x1},{y1},{x2},{y2}]"
+                    # )
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     cv2.putText(
                         frame,
@@ -885,10 +885,10 @@ def start_pipeline():
                     2,
                 )
                 if trap_ids_in_view:
-                    print(
-                        f"[INFO] {active['name']}: Currently viewing {len(trap_ids_in_view)} trap(s): "
-                        f"{sorted(trap_ids_in_view)}"
-                    )
+                    # print(
+                    #     f"[INFO] {active['name']}: Currently viewing {len(trap_ids_in_view)} trap(s): "
+                    #     f"{sorted(trap_ids_in_view)}"
+                    # )
                     print("[ACTION] Turn Off systems")
                     print(f"[METRIC] Unique traps seen so far: {len(unique_traps_seen)}")
 
