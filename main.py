@@ -5,12 +5,15 @@
 ## export SERIAL_BAUD=115200
 ## python3 main.py
 ## If your ESP32 shows up as /dev/ttyUSB0, use that instead.
+import concurrent.futures
 import json
 import os
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from queue import Full, Queue
 from typing import Any
+import uuid
 
 import cv2
 import depthai as dai
@@ -42,6 +45,81 @@ SERIAL_TIMEOUT_SEC = float(os.environ.get("SERIAL_TIMEOUT_SEC", "0.25"))
 
 _serial_lock = threading.Lock()
 _serial: serial.Serial | None = None
+
+DRIVE_QUEUE_SIZE = int(os.environ.get("DRIVE_QUEUE_SIZE", "16"))
+DRIVE_HANDLER_DEADLINE_SEC = float(os.environ.get("DRIVE_HANDLER_DEADLINE_SEC", "0.2"))
+DRIVE_QUEUE_WAIT_FALLBACK_SEC = float(os.environ.get("DRIVE_QUEUE_WAIT_FALLBACK_SEC", "0.02"))
+
+SerialResult = tuple[bool, str]
+
+
+@dataclass(slots=True)
+class SerialJob:
+    cmd: str
+    future: concurrent.futures.Future[SerialResult]
+    created_at: float
+    job_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+
+
+_drive_queue: "Queue[SerialJob]" = Queue(maxsize=DRIVE_QUEUE_SIZE)
+_drive_worker_thread: threading.Thread | None = None
+
+
+def _drive_worker_loop() -> None:
+    """Background thread draining drive commands sequentially."""
+    while True:
+        job = _drive_queue.get()
+        try:
+            ok, reply = esp32_send(job.cmd)
+            if not job.future.done():
+                job.future.set_result((ok, reply))
+        except Exception as exc:  # Serial stack already logs
+            if not job.future.done():
+                job.future.set_exception(exc)
+        finally:
+            _drive_queue.task_done()
+
+
+def _ensure_drive_worker_started() -> None:
+    """Start worker thread lazily to avoid startup penalties when not needed."""
+    global _drive_worker_thread
+    if _drive_worker_thread and _drive_worker_thread.is_alive():
+        return
+    _drive_worker_thread = threading.Thread(
+        target=_drive_worker_loop, name="drive-serial-worker", daemon=True
+    )
+    _drive_worker_thread.start()
+    print("[INFO] drive-serial-worker started.")
+
+
+def submit_drive_command(cmd: str, deadline_sec: float | None = None) -> SerialResult | None:
+    """Queue a drive command and wait up to deadline_sec for completion."""
+    _ensure_drive_worker_started()
+    future: concurrent.futures.Future[SerialResult] = concurrent.futures.Future()
+    job = SerialJob(cmd=cmd, future=future, created_at=time.monotonic())
+
+    if deadline_sec is None:
+        deadline_sec = DRIVE_HANDLER_DEADLINE_SEC
+    absolute_deadline = time.monotonic() + max(deadline_sec, 0.0)
+
+    remaining = absolute_deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+
+    queue_wait = min(DRIVE_QUEUE_WAIT_FALLBACK_SEC, remaining)
+    try:
+        _drive_queue.put(job, timeout=max(queue_wait, 0.0))
+    except Full:
+        return None
+
+    remaining = absolute_deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+
+    try:
+        return future.result(timeout=remaining)
+    except concurrent.futures.TimeoutError:
+        return None
 
 
 def _open_serial() -> None:
@@ -220,8 +298,11 @@ def api_drive_joystick():
     direction = data.get("direction")
     cmd = _command_from_direction(direction)
     if cmd:
-        ok, reply = esp32_send(cmd)
-        return (jsonify(status="ok" if ok else "err", cmd=cmd, serial=reply), 200 if ok else 502)
+        result = submit_drive_command(cmd)
+        if result is None:
+            return jsonify(error="drive queue busy", cmd=cmd), 503
+        ok, reply = result
+        return jsonify(status="ok" if ok else "err", cmd=cmd, serial=reply), 200 if ok else 502
 
     # Optional analog payload:
     #   {"x":0.1,"y":0.8}  or {"horizontal":...,"vertical":...}
@@ -235,14 +316,20 @@ def api_drive_joystick():
         return jsonify(error="bad joystick payload"), 400
 
     cmd = _command_from_axes(x_f, y_f)
-    ok, reply = esp32_send(cmd)
-    return (jsonify(status="ok" if ok else "err", cmd=cmd, serial=reply), 200 if ok else 502)
+    result = submit_drive_command(cmd)
+    if result is None:
+        return jsonify(error="drive queue busy", cmd=cmd), 503
+    ok, reply = result
+    return jsonify(status="ok" if ok else "err", cmd=cmd, serial=reply), 200 if ok else 502
 
 
 @app.post("/api/drive/stop")
 def api_drive_stop():
-    ok, reply = esp32_send("STOP")
-    return (jsonify(status="stopped" if ok else "err", serial=reply), 200 if ok else 502)
+    result = submit_drive_command("STOP")
+    if result is None:
+        return jsonify(error="drive queue busy", cmd="STOP"), 503
+    ok, reply = result
+    return jsonify(status="stopped" if ok else "err", serial=reply), 200 if ok else 502
 
 
 # --- Arduino App Endpoints ---
