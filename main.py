@@ -10,6 +10,8 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import os
+import sqlite3
+from datetime import datetime
 import threading
 import time
 import uuid
@@ -22,7 +24,7 @@ from typing import Any, Iterable
 import cv2
 import depthai as dai
 import numpy as np
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, abort, jsonify, request
 import serial
 from serial import SerialException
 
@@ -367,7 +369,12 @@ class FrameHub:
 # ======================================================================================
 
 
-def create_app(serial_controller: SerialController, frame_hub: FrameHub, mode_state: ModeState) -> Flask:
+def create_app(
+    serial_controller: SerialController,
+    frame_hub: FrameHub,
+    mode_state: ModeState,
+    db: DetectionDatabase,
+) -> Flask:
     app = Flask(__name__)
 
     @app.post("/auth/login")
@@ -440,6 +447,27 @@ def create_app(serial_controller: SerialController, frame_hub: FrameHub, mode_st
     @app.post("/api/fan/off")
     def api_fan_off():
         return _simple_serial_endpoint("FAN OFF")
+
+    @app.get("/api/pests")
+    def api_list_pests():
+        summaries = db.fetch_pest_summaries()
+        return jsonify(
+            {
+                "pests": summaries,
+                "total_tracked": len(summaries),
+                "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            }
+        )
+
+    @app.get("/api/pests/<path:label>")
+    def api_get_pest(label: str):
+        normalized = label.strip()
+        if not normalized:
+            abort(400, description="Pest label cannot be empty.")
+        summaries = db.fetch_pest_summaries(normalized)
+        if not summaries:
+            abort(404, description=f"No records found for '{normalized}'.")
+        return jsonify(summaries[0])
 
     @app.get("/api/mode")
     def api_get_mode():
@@ -781,6 +809,165 @@ def create_device_context(pipeline_obj: dai.Pipeline, device_info: dai.DeviceInf
             device.close()
 
 
+# === DATABASE SETUP ===
+DB_PATH = os.environ.get("DB_PATH", "pest_results.db")
+
+
+class DetectionDatabase:
+    """Encapsulates SQLite initialization, writes, and summary queries."""
+
+    def __init__(self, db_path: str) -> None:
+        self.db_path = Path(db_path)
+
+    def initialize(self) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS detections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts_utc TEXT NOT NULL,
+                    camera_name TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    xmin INTEGER NOT NULL,
+                    ymin INTEGER NOT NULL,
+                    xmax INTEGER NOT NULL,
+                    ymax INTEGER NOT NULL,
+                    frame_w INTEGER NOT NULL,
+                    frame_h INTEGER NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trap_sightings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts_utc TEXT NOT NULL,
+                    camera_name TEXT NOT NULL,
+                    marker_id INTEGER NOT NULL,
+                    trap_name TEXT,
+                    location TEXT
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pest_summary (
+                    label TEXT PRIMARY KEY,
+                    detection_count INTEGER NOT NULL DEFAULT 0,
+                    last_seen_utc TEXT NOT NULL,
+                    last_seen_camera TEXT
+                );
+                """
+            )
+            conn.commit()
+            print("[INFO] Database initialized successfully.")
+
+    def open_writer(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        return conn
+
+    def record_detection(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        camera_name: str,
+        label: str,
+        confidence: float,
+        bounds: tuple[int, int, int, int],
+        frame_size: tuple[int, int],
+    ) -> str:
+        ts_utc = self._utc_now()
+        xmin, ymin, xmax, ymax = bounds
+        frame_w, frame_h = frame_size
+        conn.execute(
+            """
+            INSERT INTO detections (
+                ts_utc, camera_name, label, confidence, xmin, ymin, xmax, ymax, frame_w, frame_h
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (ts_utc, camera_name, label, confidence, xmin, ymin, xmax, ymax, frame_w, frame_h),
+        )
+        self._upsert_pest_summary(conn, label, ts_utc, camera_name)
+        return ts_utc
+
+    def record_trap_sighting(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        camera_name: str,
+        marker_id: int,
+        trap_name: str,
+        location: str | None,
+    ) -> str:
+        ts_utc = self._utc_now()
+        conn.execute(
+            """
+            INSERT INTO trap_sightings (ts_utc, camera_name, marker_id, trap_name, location)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (ts_utc, camera_name, marker_id, trap_name, location),
+        )
+        return ts_utc
+
+    def fetch_pest_summaries(self, label: str | None = None) -> list[dict[str, Any]]:
+        query = """
+            SELECT label, detection_count, last_seen_utc, last_seen_camera
+            FROM pest_summary
+        """
+        params: tuple[Any, ...] = ()
+        if label:
+            query += " WHERE label = ?"
+            params = (label,)
+        query += " ORDER BY detection_count DESC, last_seen_utc DESC"
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(query, params).fetchall()
+
+        return [
+            {
+                "label": row["label"],
+                "count": int(row["detection_count"]),
+                "last_seen_utc": row["last_seen_utc"],
+                "last_seen_camera": row["last_seen_camera"],
+            }
+            for row in rows
+        ]
+
+    def maybe_commit(self, conn: sqlite3.Connection, last_commit_ts: float, interval_sec: float) -> float:
+        now = time.time()
+        if now - last_commit_ts >= interval_sec:
+            conn.commit()
+            return now
+        return last_commit_ts
+
+    def _upsert_pest_summary(
+        self,
+        conn: sqlite3.Connection,
+        label: str,
+        ts_utc: str,
+        camera_name: str | None = None,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO pest_summary (label, detection_count, last_seen_utc, last_seen_camera)
+            VALUES (?, 1, ?, ?)
+            ON CONFLICT(label) DO UPDATE SET
+                detection_count = pest_summary.detection_count + 1,
+                last_seen_utc = excluded.last_seen_utc,
+                last_seen_camera = excluded.last_seen_camera;
+            """,
+            (label, ts_utc, camera_name),
+        )
+
+    @staticmethod
+    def _utc_now() -> str:
+        return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+
+
 def partition_device_infos(
     all_devices: list[dai.DeviceInfo],
     pest_count: int = 2,
@@ -802,10 +989,22 @@ def partition_device_infos(
     return pest_devices, obstacle_devices
 
 
-def start_pipeline(frame_hub: FrameHub, device_infos_override: list[dai.DeviceInfo] | None = None) -> None:
+def start_pipeline(
+    frame_hub: FrameHub,
+    db: DetectionDatabase,
+    device_infos_override: list[dai.DeviceInfo] | None = None,
+) -> None:
+    db.initialize()
+    conn = db.open_writer()
+    last_commit = time.time()
+
+    if DEFAULT_MODEL_BLOB is None:
+        raise RuntimeError("DEFAULT_MODEL_BLOB is not set; ensure RESULT_DIR points to a valid export.")
+
+    model_blob_path = str(DEFAULT_MODEL_BLOB)
     camera_setups = [
-        CameraSetup(name="camera_1_left", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
-        CameraSetup(name="camera_2_right", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
+        CameraSetup(name="camera_1_left", blob_path=model_blob_path),
+        CameraSetup(name="camera_2_right", blob_path=model_blob_path),
     ]
 
     pipeline_bundles: list[PipelineBundle] = []
@@ -883,6 +1082,15 @@ def start_pipeline(frame_hub: FrameHub, device_infos_override: list[dai.DeviceIn
                     label = label_map[det.label] if det.label < len(label_map) else f"ID:{det.label}"
                     confidence = det.confidence
 
+                    db.record_detection(
+                        conn,
+                        camera_name=active["name"],
+                        label=label,
+                        confidence=float(confidence),
+                        bounds=(x1, y1, x2, y2),
+                        frame_size=(frame.shape[1], frame.shape[0]),
+                    )
+
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     cv2.putText(
                         frame,
@@ -897,6 +1105,15 @@ def start_pipeline(frame_hub: FrameHub, device_infos_override: list[dai.DeviceIn
                 trap_detections = detect_pest_traps(frame)
                 if trap_detections:
                     annotate_traps(frame, trap_detections, active["name"])
+                    for trap_det in trap_detections:
+                        db.record_trap_sighting(
+                            conn,
+                            camera_name=active["name"],
+                            marker_id=trap_det["marker_id"],
+                            trap_name=trap_det["trap_name"],
+                            location=trap_det["location"],
+                        )
+
                 trap_ids_in_view = {detection["marker_id"] for detection in trap_detections}
                 active["visible_traps"] = trap_ids_in_view
                 unique_traps_seen.update(trap_ids_in_view)
@@ -925,6 +1142,15 @@ def start_pipeline(frame_hub: FrameHub, device_infos_override: list[dai.DeviceIn
                 if trap_ids_in_view:
                     print("[ACTION] Turn Off systems")
                     print(f"[METRIC] Unique traps seen so far: {len(unique_traps_seen)}")
+
+            # COMMIT DATABASE EVERY 5 SECONDS
+            previous_commit = last_commit
+            last_commit = db.maybe_commit(conn, last_commit, interval_sec=5.0)
+            if last_commit != previous_commit:
+                print("[DEBUG] Database committed.")
+
+    conn.close()
+
 
 
 # ======================================================================================
@@ -1191,7 +1417,8 @@ SERIAL_CONTROLLER = SerialController(
 )
 FRAME_HUB = FrameHub()
 MODE_STATE = ModeState()
-app = create_app(SERIAL_CONTROLLER, FRAME_HUB, MODE_STATE)
+DETECTION_DB = DetectionDatabase(DB_PATH)
+app = create_app(SERIAL_CONTROLLER, FRAME_HUB, MODE_STATE, DETECTION_DB)
 
 
 def main() -> None:
@@ -1201,7 +1428,7 @@ def main() -> None:
     if pest_devices:
         pipeline_thread = threading.Thread(
             target=start_pipeline,
-            args=(FRAME_HUB, pest_devices),
+            args=(FRAME_HUB, DETECTION_DB, pest_devices),
             daemon=True,
         )
         pipeline_thread.start()
