@@ -160,6 +160,77 @@ class SerialController:
             print(f"[ERROR] Failed to open serial {self.port}: {exc}")
 
 
+class SerialWriterAdapter:
+    """Lightweight shim so other subsystems can reuse SerialController APIs."""
+
+    def __init__(self, controller: SerialController | None) -> None:
+        self._controller = controller
+
+    def write(self, payload: bytes) -> None:
+        if not self._controller:
+            return
+        try:
+            command = payload.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            return
+        if command:
+            self._controller.send(command)
+
+    def close(self) -> None:  # pragma: no cover - noop shim
+        return
+
+
+class ModeState:
+    """Thread-safe robot mode tracking (manual vs autonomous)."""
+
+    MANUAL = "manual"
+    AUTONOMOUS = "autonomous"
+    _VALID = {MANUAL, AUTONOMOUS}
+
+    def __init__(self, initial_mode: str = MANUAL) -> None:
+        self._mode = self._normalize(initial_mode)
+        self._condition = threading.Condition()
+
+    @classmethod
+    def _normalize(cls, mode: str) -> str:
+        if not isinstance(mode, str):
+            raise ValueError("Mode must be provided as a string.")
+        normalized = mode.strip().lower()
+        if normalized not in cls._VALID:
+            raise ValueError("Mode must be either 'manual' or 'autonomous'.")
+        return normalized
+
+    def set_mode(self, new_mode: str) -> bool:
+        normalized = self._normalize(new_mode)
+        with self._condition:
+            changed = self._mode != normalized
+            self._mode = normalized
+            if changed:
+                self._condition.notify_all()
+            return changed
+
+    def get_mode(self) -> str:
+        with self._condition:
+            return self._mode
+
+    def is_autonomous(self) -> bool:
+        return self.get_mode() == self.AUTONOMOUS
+
+    def wait_for_mode(self, target_mode: str, timeout: float | None = None) -> bool:
+        normalized_target = self._normalize(target_mode)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while self._mode != normalized_target:
+                if timeout is None:
+                    self._condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(timeout=remaining)
+            return True
+
+
 _DIRECTION_ALIAS = {
     "forward": "FORWARD",
     "fwd": "FORWARD",
@@ -296,7 +367,7 @@ class FrameHub:
 # ======================================================================================
 
 
-def create_app(serial_controller: SerialController, frame_hub: FrameHub) -> Flask:
+def create_app(serial_controller: SerialController, frame_hub: FrameHub, mode_state: ModeState) -> Flask:
     app = Flask(__name__)
 
     @app.post("/auth/login")
@@ -369,6 +440,22 @@ def create_app(serial_controller: SerialController, frame_hub: FrameHub) -> Flas
     @app.post("/api/fan/off")
     def api_fan_off():
         return _simple_serial_endpoint("FAN OFF")
+
+    @app.get("/api/mode")
+    def api_get_mode():
+        return jsonify(mode=mode_state.get_mode()), 200
+
+    @app.post("/api/mode")
+    def api_set_mode():
+        data = request.get_json(silent=True) or {}
+        requested_mode = data.get("mode")
+        if not isinstance(requested_mode, str):
+            return jsonify(error="mode must be provided as a string"), 400
+        try:
+            changed = mode_state.set_mode(requested_mode)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        return jsonify(mode=mode_state.get_mode(), changed=changed), 200
 
     @app.route("/video")
     def video():
@@ -694,7 +781,28 @@ def create_device_context(pipeline_obj: dai.Pipeline, device_info: dai.DeviceInf
             device.close()
 
 
-def start_pipeline(frame_hub: FrameHub) -> None:
+def partition_device_infos(
+    all_devices: list[dai.DeviceInfo],
+    pest_count: int = 2,
+    obstacle_count: int = 2,
+) -> tuple[list[dai.DeviceInfo], list[dai.DeviceInfo]]:
+    """Split connected DepthAI devices between pest ID and obstacle detection roles."""
+    pest_devices = list(all_devices[:pest_count])
+    obstacle_devices = list(all_devices[pest_count : pest_count + obstacle_count])
+
+    if len(pest_devices) < pest_count:
+        print(
+            f"[WARN] Requested {pest_count} pest-ID cameras but only {len(pest_devices)} device(s) available for that role."
+        )
+    if len(obstacle_devices) < obstacle_count:
+        print(
+            f"[WARN] Requested {obstacle_count} obstacle cameras but only {len(obstacle_devices)} device(s) allocated."
+        )
+
+    return pest_devices, obstacle_devices
+
+
+def start_pipeline(frame_hub: FrameHub, device_infos_override: list[dai.DeviceInfo] | None = None) -> None:
     camera_setups = [
         CameraSetup(name="camera_1_left", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
         CameraSetup(name="camera_2_right", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
@@ -705,7 +813,7 @@ def start_pipeline(frame_hub: FrameHub) -> None:
         bundle = build_pipeline(setup)
         pipeline_bundles.append(bundle)
 
-    available_devices = dai.Device.getAllAvailableDevices()
+    available_devices = device_infos_override if device_infos_override is not None else dai.Device.getAllAvailableDevices()
     if not available_devices:
         raise RuntimeError("[ERROR] No DepthAI devices detected.")
 
@@ -820,6 +928,259 @@ def start_pipeline(frame_hub: FrameHub) -> None:
 
 
 # ======================================================================================
+# Obstacle Detection Thread
+# ======================================================================================
+
+
+def run_obstacle_detection(
+    serial_controller: SerialController | None,
+    device_infos_override: list[dai.DeviceInfo] | None = None,
+    mode_state: ModeState | None = None,
+) -> None:
+    """Run the provided obstacle detection loop alongside pest-identification cameras."""
+    # Hardware Communication Protocols
+    SERIAL_PORT_OBST = SERIAL_PORT
+    BAUD_RATE = SERIAL_BAUD
+
+    if serial_controller is not None:
+        esp32 = SerialWriterAdapter(serial_controller)
+    else:
+        try:
+            esp32 = serial.Serial(SERIAL_PORT_OBST, BAUD_RATE, timeout=0.1)
+            time.sleep(2)
+        except serial.SerialException as e:
+            print(f"Warning: Serial initialization failed: {e}")
+            esp32 = None
+
+    FPS_LIMIT = 30
+    should_quit = False
+    MANUAL_WAIT_INTERVAL_SEC = 0.25
+
+    # System Parameters & Constraints
+    SAFE_DISTANCE_MM = 300
+    MIN_CONTOUR_AREA = 500
+    MISSING_LINE_THRESHOLD = 15  # Frame threshold to trigger camera failover
+
+    OBST_ROI_W, OBST_ROI_H = 100, 100
+    OBST_ROI_X = (640 - OBST_ROI_W) // 2
+    OBST_ROI_Y = (380 - OBST_ROI_H) // 2
+
+    LINE_ROI_W, LINE_ROI_H = 200, 200
+    LINE_ROI_X, LINE_ROI_Y = (640 - LINE_ROI_W) // 2, 280
+
+    # DepthAI Multi-Device Configuration
+    device_infos = device_infos_override if device_infos_override is not None else dai.Device.getAllAvailableDevices()
+    num_cams = len(device_infos)
+    print(f"Initialized hub. Devices detected: {num_cams}")
+
+    if num_cams == 0:
+        raise RuntimeError("Hardware Error: Zero OAK-D devices enumerated.")
+
+    active_cam_idx = 1
+    missing_line_frames = 0
+
+    # Context manager for safe multi-device USB allocation
+    with ExitStack() as stack:
+        rgb_qs = []
+        depth_qs = []
+
+        # Initialize connected DepthAI devices
+        for i, info in enumerate(device_infos):
+            device = stack.enter_context(dai.Device(info))
+            pipeline = stack.enter_context(dai.Pipeline(device))
+
+            # Configure stereo and RGB nodes
+            left = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
+            right = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
+            rgb_cam = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
+
+            rgb_out = rgb_cam.requestOutput((640, 480), dai.ImgFrame.Type.BGR888p)
+
+            stereo = pipeline.create(dai.node.StereoDepth)
+            stereo.setLeftRightCheck(True)
+            stereo.setSubpixel(False)
+
+            left.requestOutput((640, 400)).link(stereo.left)
+            right.requestOutput((640, 400)).link(stereo.right)
+
+            # Instantiate device-scoped non-blocking queues prior to pipeline execution
+            rgb_qs.append(rgb_out.createOutputQueue(maxSize=4, blocking=False))
+            depth_qs.append(stereo.depth.createOutputQueue(maxSize=4, blocking=False))
+
+            pipeline.start()
+
+            print(f"Pipeline active for Device {i} [ID: {info.getDeviceId()}]")
+            time.sleep(0.2)  # Hardware stabilization delay
+
+        print("\nSystem active. Awaiting user interrupt (q).")
+        last_frame_time = time.time()
+
+        last_command_sent: bytes | None = None
+
+        while not should_quit:
+            if mode_state is not None and not mode_state.is_autonomous():
+                if esp32 and last_command_sent != b"STOP\n":
+                    esp32.write(b"STOP\n")
+                    last_command_sent = b"STOP\n"
+                mode_state.wait_for_mode(ModeState.AUTONOMOUS, timeout=MANUAL_WAIT_INTERVAL_SEC)
+                continue
+
+            current_time = time.time()
+            if current_time - last_frame_time < (1.0 / FPS_LIMIT):
+                time.sleep(0.001)
+                continue
+            last_frame_time = current_time
+
+            # Clear buffer queues across all devices to prevent USB overflow
+            for i in range(num_cams):
+                in_depth = depth_qs[i].tryGet()
+                in_rgb = rgb_qs[i].tryGet()
+
+                # Isolate computer vision processing to the active camera stream
+                if i == active_cam_idx and in_depth is not None and in_rgb is not None:
+                    depth_frame = in_depth.getFrame()
+                    rgb_frame = in_rgb.getCvFrame()
+
+                    # Depth Processing & Obstacle Detection
+                    obst_roi = depth_frame[OBST_ROI_Y : OBST_ROI_Y + OBST_ROI_H, OBST_ROI_X : OBST_ROI_X + OBST_ROI_W]
+                    valid_depths = obst_roi[obst_roi > 0]
+                    distance = int(np.percentile(valid_depths, 25)) if valid_depths.size else 9999
+
+                    color_status = (0, 0, 255) if (0 < distance < SAFE_DISTANCE_MM) else (0, 255, 0)
+                    cv2.rectangle(
+                        rgb_frame,
+                        (OBST_ROI_X, OBST_ROI_Y),
+                        (OBST_ROI_X + OBST_ROI_W, OBST_ROI_Y + OBST_ROI_H),
+                        color_status,
+                        2,
+                    )
+                    cv2.putText(
+                        rgb_frame,
+                        f"Dist: {distance}mm",
+                        (OBST_ROI_X, OBST_ROI_Y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        color_status,
+                        2,
+                    )
+
+                    # Vision Processing & Trajectory Calculation
+                    line_roi_slice = rgb_frame[LINE_ROI_Y : LINE_ROI_Y + LINE_ROI_H, LINE_ROI_X : LINE_ROI_X + LINE_ROI_W]
+
+                    # Apply HSV transformation and aggregate red hue boundaries
+                    hsv_roi = cv2.cvtColor(line_roi_slice, cv2.COLOR_BGR2HSV)
+
+                    lower_red_1 = np.array([0, 100, 100])
+                    upper_red_1 = np.array([10, 255, 255])
+                    mask1 = cv2.inRange(hsv_roi, lower_red_1, upper_red_1)
+
+                    lower_red_2 = np.array([160, 100, 100])
+                    upper_red_2 = np.array([180, 255, 255])
+                    mask2 = cv2.inRange(hsv_roi, lower_red_2, upper_red_2)
+
+                    thresh = cv2.bitwise_or(mask1, mask2)
+
+                    # Diagnostic output window
+                    cv2.imshow("Binary Mask", thresh)
+
+                    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                    line_detected = False
+                    error = 0
+                    box_center_x = LINE_ROI_W // 2
+
+                    cv2.rectangle(
+                        rgb_frame,
+                        (LINE_ROI_X, LINE_ROI_Y),
+                        (LINE_ROI_X + LINE_ROI_W, LINE_ROI_Y + LINE_ROI_H),
+                        (0, 255, 255),
+                        2,
+                    )
+
+                    if contours:
+                        c = max(contours, key=cv2.contourArea)
+                        if cv2.contourArea(c) > MIN_CONTOUR_AREA:
+                            M = cv2.moments(c)
+                            if M["m00"] != 0:
+                                error = int(M["m10"] / M["m00"]) - box_center_x
+                                line_detected = True
+                                cv2.circle(
+                                    rgb_frame,
+                                    (int(M["m10"] / M["m00"]) + LINE_ROI_X, int(M["m01"] / M["m00"]) + LINE_ROI_Y),
+                                    5,
+                                    (0, 0, 255),
+                                    -1,
+                                )
+
+                    # State Machine & Actuation Logic
+                    command_to_send = b"STOP\n"
+                    status = ""
+
+                    # Hardware index mapping
+                    FRONT_CAM_INDEX = 1
+                    REAR_CAM_INDEX = 0
+
+                    if 0 < distance < SAFE_DISTANCE_MM:
+                        status = "STOP! OBSTACLE"
+                        command_to_send = b"STOP\n"
+
+                    elif line_detected:
+                        missing_line_frames = 0
+                        if active_cam_idx == FRONT_CAM_INDEX:
+                            if error < -15:
+                                status, command_to_send = "Turn LEFT", b"LEFT\n"
+                            elif error > 15:
+                                status, command_to_send = "Turn RIGHT", b"RIGHT\n"
+                            else:
+                                status, command_to_send = "FORWARD", b"FORWARD\n"
+                        elif active_cam_idx == REAR_CAM_INDEX:
+                            if error < -15:
+                                status, command_to_send = "Reverse LEFT", b"LEFT\n"
+                            elif error > 15:
+                                status, command_to_send = "Reverse RIGHT", b"RIGHT\n"
+                            else:
+                                status, command_to_send = "BACKWARD", b"BACKWARD\n"
+
+                    else:
+                        # Handle trajectory loss and execute failover sequence
+                        missing_line_frames += 1
+                        status = f"Searching... ({missing_line_frames}/{MISSING_LINE_THRESHOLD})"
+                        command_to_send = b"STOP\n"
+
+                        if missing_line_frames >= MISSING_LINE_THRESHOLD:
+                            if num_cams > 1:
+                                active_cam_idx = REAR_CAM_INDEX if active_cam_idx == FRONT_CAM_INDEX else FRONT_CAM_INDEX
+                                missing_line_frames = 0
+                                print(f"\n[SYSTEM] Executing failover. Active feed: Camera {active_cam_idx}")
+                                time.sleep(0.5)
+                            else:
+                                status = "END OF TAPE. STOPPED."
+
+                    if esp32:
+                        if command_to_send != last_command_sent:
+                            esp32.write(command_to_send)
+                            last_command_sent = command_to_send
+
+                    # Render active camera telemetry
+                    cam_label = "FRONT CAM" if active_cam_idx == FRONT_CAM_INDEX else "REAR CAM"
+                    cv2.putText(rgb_frame, cam_label, (450, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
+                    cv2.putText(rgb_frame, status, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
+
+                    cv2.imshow("Robot View", rgb_frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        should_quit = True
+
+    # System Teardown
+    cv2.destroyAllWindows()
+    if esp32:
+        print("\nInitiating safe shutdown sequence...")
+        esp32.write(b"STOP\n")
+        time.sleep(0.1)
+        esp32.close()
+        print("Actuators disengaged. Offline.")
+
+
+# ======================================================================================
 # Application bootstrap
 # ======================================================================================
 
@@ -829,12 +1190,34 @@ SERIAL_CONTROLLER = SerialController(
     timeout_sec=SERIAL_TIMEOUT_SEC,
 )
 FRAME_HUB = FrameHub()
-app = create_app(SERIAL_CONTROLLER, FRAME_HUB)
+MODE_STATE = ModeState()
+app = create_app(SERIAL_CONTROLLER, FRAME_HUB, MODE_STATE)
 
 
 def main() -> None:
-    pipeline_thread = threading.Thread(target=start_pipeline, args=(FRAME_HUB,), daemon=True)
-    pipeline_thread.start()
+    all_device_infos = dai.Device.getAllAvailableDevices()
+    pest_devices, obstacle_devices = partition_device_infos(all_device_infos)
+
+    if pest_devices:
+        pipeline_thread = threading.Thread(
+            target=start_pipeline,
+            args=(FRAME_HUB, pest_devices),
+            daemon=True,
+        )
+        pipeline_thread.start()
+    else:
+        print("[WARN] Skipping pest identification pipeline due to missing devices.")
+
+    if obstacle_devices:
+        obstacle_thread = threading.Thread(
+            target=run_obstacle_detection,
+            args=(SERIAL_CONTROLLER, obstacle_devices, MODE_STATE),
+            daemon=True,
+        )
+        obstacle_thread.start()
+    else:
+        print("[WARN] Skipping obstacle detection due to missing dedicated devices.")
+
     app.run(host="0.0.0.0", port=5000, threaded=True)
 
 
