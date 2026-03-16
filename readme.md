@@ -23,6 +23,15 @@ When you run `python main.py` the script also spins up a lightweight Flask serve
 
 Because the server binds to `0.0.0.0`, you can monitor the cameras from any machine on the same network by hitting the host’s IP address. Adjust the host/port inside `main.py` if your deployment requires something different.
 
+## Pest summary API for mobile apps
+
+The Flask server now keeps a running count of every pest label observed (e.g., “Fungus gnats”) and stores the latest UTC timestamp + camera that produced it. This data is exposed over HTTP so a mobile app can poll for updates:
+
+- `GET /api/pests` returns an object with `pests` (array of `{label, count, last_seen_utc, last_seen_camera}` items), the number of tracked labels, and the generation timestamp.
+- `GET /api/pests/<label>` (URL-encode spaces) returns just the summary for a single pest label and responds with HTTP 404 if nothing has been recorded yet.
+
+Both endpoints read from the `pest_summary` table, which is refreshed in real time as detections are inserted into the database. No authentication is implemented, so keep the service on a trusted network.
+
 ## Integrated ArUco marker detection
 
 In addition to YOLO detections, each frame is scanned for 4×4 ArUco markers (OpenCV dictionary `DICT_4X4_50`). Marker IDs are looked up in the `TRAP_REGISTRY` table to attach friendly trap names and locations, and the overlays also include live counters (per camera, plus the total number of unique traps seen so far). Update `TRAP_REGISTRY` in `main.py` with the IDs/metadata that match your printed markers and deployment layout.

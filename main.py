@@ -1,10 +1,7 @@
 import json
 import os
-<<<<<<< Updated upstream
 import csv
-=======
 import sqlite3
->>>>>>> Stashed changes
 from datetime import datetime
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -16,7 +13,7 @@ import depthai as dai
 import numpy as np
 
 # --- Flask Streaming Imports ---
-from flask import Flask, Response
+from flask import Flask, Response, jsonify, abort
 import threading
 import time
 
@@ -85,6 +82,29 @@ def index():
     return '<h1>Live Stream</h1><img src="/video"/>'
 
 
+@app.route("/api/pests", methods=["GET"])
+def list_pests():
+    summaries = fetch_pest_summaries()
+    return jsonify(
+        {
+            "pests": summaries,
+            "total_tracked": len(summaries),
+            "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        }
+    )
+
+
+@app.route("/api/pests/<path:label>", methods=["GET"])
+def get_pest(label: str):
+    normalized = label.strip()
+    if not normalized:
+        abort(400, description="Pest label cannot be empty.")
+    summaries = fetch_pest_summaries(normalized)
+    if not summaries:
+        abort(404, description=f"No records found for '{normalized}'.")
+    return jsonify(summaries[0])
+
+
 def load_config(config_path: Path) -> dict[str, Any]:
     with open(config_path, "r", encoding="utf-8") as config_file:
         return json.load(config_file)
@@ -112,7 +132,7 @@ def resolve_model_artifacts(result_dir: Path) -> tuple[Path, Path]:
     return _pick_preferred(blob_files), _pick_preferred(json_files)
 
 
-RESULT_DIR = Path(os.environ.get("RESULT_DIR", "my_blobs/pestv5"))
+RESULT_DIR = Path(os.environ.get("RESULT_DIR", "my_blobs/pestv5March"))
 MODEL_CONFIG: dict[str, Any] | None = None
 DEFAULT_MODEL_BLOB: Path | None = None
 label_map: list[str] = []
@@ -451,19 +471,66 @@ def init_db() -> None:
                 location TEXT
             );
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pest_summary (
+                label TEXT PRIMARY KEY,
+                detection_count INTEGER NOT NULL DEFAULT 0,
+                last_seen_utc TEXT NOT NULL,
+                last_seen_camera TEXT
+            );
+        """)
         conn.commit()
         print("[INFO] Database initialized successfully.")
 
 
+def upsert_pest_summary(
+    conn: sqlite3.Connection, label: str, ts_utc: str, camera_name: str | None = None
+) -> None:
+    """Increment the running detection count for a pest and refresh its last-seen metadata."""
+    conn.execute(
+        """
+        INSERT INTO pest_summary (label, detection_count, last_seen_utc, last_seen_camera)
+        VALUES (?, 1, ?, ?)
+        ON CONFLICT(label) DO UPDATE SET
+            detection_count = pest_summary.detection_count + 1,
+            last_seen_utc = excluded.last_seen_utc,
+            last_seen_camera = excluded.last_seen_camera;
+        """,
+        (label, ts_utc, camera_name),
+    )
+
+
+def fetch_pest_summaries(label: str | None = None) -> list[dict[str, Any]]:
+    """Return aggregated pest counts (optionally filtered by label) for API responses."""
+    query = """
+        SELECT label, detection_count, last_seen_utc, last_seen_camera
+        FROM pest_summary
+    """
+    params: tuple[Any, ...] = ()
+    if label:
+        query += " WHERE label = ?"
+        params = (label,)
+    query += " ORDER BY detection_count DESC, last_seen_utc DESC"
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(query, params).fetchall()
+
+    summaries = []
+    for row in rows:
+        summaries.append(
+            {
+                "label": row["label"],
+                "count": int(row["detection_count"]),
+                "last_seen_utc": row["last_seen_utc"],
+                "last_seen_camera": row["last_seen_camera"],
+            }
+        )
+    return summaries
+
+
 # --- Pipeline Thread Function ---
 def start_pipeline():
-<<<<<<< Updated upstream
-    camera_setups = [
-        CameraSetup(name="camera_1_left", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
-        CameraSetup(name="camera_2_right", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
-        #CameraSetup(name="camera_3_front", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
-        #CameraSetup(name="camera_4_back", blob_path="my_blobs/pestv5/best_openvino_2022.1_6shave.blob"),
-=======
     init_db()
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -476,7 +543,6 @@ def start_pipeline():
     camera_setups = [
         CameraSetup(name="camera_1_left", blob_path=model_blob_path),
         CameraSetup(name="camera_2_right", blob_path=model_blob_path),
->>>>>>> Stashed changes
     ]
 
     pipeline_bundles: list[PipelineBundle] = []
@@ -572,6 +638,7 @@ def start_pipeline():
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (ts_utc, active["name"], label, float(confidence), x1, y1, x2, y2, frame.shape[1], frame.shape[0])
                     )
+                    upsert_pest_summary(conn, label, ts_utc, active["name"])
 
                     print(
                         f"[DEBUG] {active['name']}: Detected {label} ({confidence:.2f}) "
