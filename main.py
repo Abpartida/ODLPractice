@@ -41,6 +41,13 @@ DRIVE_QUEUE_SIZE = int(os.environ.get("DRIVE_QUEUE_SIZE", "16"))
 DRIVE_HANDLER_DEADLINE_SEC = float(os.environ.get("DRIVE_HANDLER_DEADLINE_SEC", "0.2"))
 DRIVE_QUEUE_WAIT_FALLBACK_SEC = float(os.environ.get("DRIVE_QUEUE_WAIT_FALLBACK_SEC", "0.02"))
 
+# Default actuator commands (override via env vars if firmware differs)
+FAN_ON_COMMAND = os.environ.get("FAN_ON_COMMAND", "FAN")
+FAN_OFF_COMMAND = os.environ.get("FAN_OFF_COMMAND", "STOP")
+LIFT_UP_COMMAND = os.environ.get("LIFT_UP_COMMAND", "UP")
+LIFT_DOWN_COMMAND = os.environ.get("LIFT_DOWN_COMMAND", "DOWN")
+#LIFT_STOP_COMMAND = os.environ.get("LIFT_STOP_COMMAND", "STOP")
+
 SerialResult = tuple[bool, str]
 
 
@@ -426,27 +433,27 @@ def create_app(
 
     def _simple_serial_endpoint(command: str):
         ok, reply = serial_controller.send(command)
-        return jsonify(ok=ok, reply=reply), 200 if ok else 502
+        return jsonify(ok=ok, command=command, reply=reply), 200 if ok else 502
 
     @app.post("/api/lift/up")
     def api_lift_up():
-        return _simple_serial_endpoint("LIFT UP")
+        return _simple_serial_endpoint(LIFT_UP_COMMAND)
 
     @app.post("/api/lift/down")
     def api_lift_down():
-        return _simple_serial_endpoint("LIFT DOWN")
+        return _simple_serial_endpoint(LIFT_DOWN_COMMAND)
 
-    @app.post("/api/lift/stop")
-    def api_lift_stop():
-        return _simple_serial_endpoint("LIFT STOP")
+#    @app.post("/api/lift/stop")
+#    def api_lift_stop():
+#        return _simple_serial_endpoint(LIFT_STOP_COMMAND)
 
     @app.post("/api/fan/on")
     def api_fan_on():
-        return _simple_serial_endpoint("FAN ON")
+        return _simple_serial_endpoint(FAN_ON_COMMAND)
 
     @app.post("/api/fan/off")
     def api_fan_off():
-        return _simple_serial_endpoint("FAN OFF")
+        return _simple_serial_endpoint(FAN_OFF_COMMAND)
 
     @app.get("/api/pests")
     def api_list_pests():
@@ -501,7 +508,7 @@ def create_app(
 # ======================================================================================
 
 
-RESULT_DIR = Path(os.environ.get("RESULT_DIR", "my_blobs/pestv5"))
+RESULT_DIR = Path(os.environ.get("RESULT_DIR", "my_blobs/pestv5March"))
 MODEL_CONFIG: dict[str, Any] | None = None
 MODEL_CONFIG_PATH: Path | None = None
 DEFAULT_MODEL_BLOB: Path | None = None
@@ -1162,8 +1169,9 @@ def run_obstacle_detection(
     serial_controller: SerialController | None,
     device_infos_override: list[dai.DeviceInfo] | None = None,
     mode_state: ModeState | None = None,
+    frame_hub: FrameHub | None = None,
 ) -> None:
-    """Run the provided obstacle detection loop alongside pest-identification cameras."""
+    """Run the provided obstacle detection loop alongside pest-identification cameras and publish frames."""
     # Hardware Communication Protocols
     SERIAL_PORT_OBST = SERIAL_PORT
     BAUD_RATE = SERIAL_BAUD
@@ -1202,7 +1210,14 @@ def run_obstacle_detection(
     if num_cams == 0:
         raise RuntimeError("Hardware Error: Zero OAK-D devices enumerated.")
 
-    active_cam_idx = 1
+    camera_labels = [f"obstacle_cam_{idx}" for idx in range(num_cams)]
+    if num_cams >= 2:
+        camera_labels[0] = "obstacle_rear"
+        camera_labels[1] = "obstacle_front"
+    elif num_cams == 1:
+        camera_labels[0] = "obstacle_front"
+
+    active_cam_idx = 1 if num_cams > 1 else 0
     missing_line_frames = 0
 
     # Context manager for safe multi-device USB allocation
@@ -1261,11 +1276,11 @@ def run_obstacle_detection(
             for i in range(num_cams):
                 in_depth = depth_qs[i].tryGet()
                 in_rgb = rgb_qs[i].tryGet()
+                rgb_frame = in_rgb.getCvFrame() if in_rgb is not None else None
 
                 # Isolate computer vision processing to the active camera stream
-                if i == active_cam_idx and in_depth is not None and in_rgb is not None:
+                if i == active_cam_idx and in_depth is not None and rgb_frame is not None:
                     depth_frame = in_depth.getFrame()
-                    rgb_frame = in_rgb.getCvFrame()
 
                     # Depth Processing & Obstacle Detection
                     obst_roi = depth_frame[OBST_ROI_Y : OBST_ROI_Y + OBST_ROI_H, OBST_ROI_X : OBST_ROI_X + OBST_ROI_W]
@@ -1343,7 +1358,7 @@ def run_obstacle_detection(
                     status = ""
 
                     # Hardware index mapping
-                    FRONT_CAM_INDEX = 1
+                    FRONT_CAM_INDEX = 1 if num_cams > 1 else 0
                     REAR_CAM_INDEX = 0
 
                     if 0 < distance < SAFE_DISTANCE_MM:
@@ -1388,13 +1403,18 @@ def run_obstacle_detection(
                             last_command_sent = command_to_send
 
                     # Render active camera telemetry
-                    cam_label = "FRONT CAM" if active_cam_idx == FRONT_CAM_INDEX else "REAR CAM"
+                    cam_label = camera_labels[active_cam_idx].replace("_", " ").upper()
                     cv2.putText(rgb_frame, cam_label, (450, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
                     cv2.putText(rgb_frame, status, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
 
                     cv2.imshow("Robot View", rgb_frame)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         should_quit = True
+
+                    if frame_hub is not None:
+                        frame_hub.update(camera_labels[i], rgb_frame)
+                elif rgb_frame is not None and frame_hub is not None:
+                    frame_hub.update(camera_labels[i], rgb_frame)
 
     # System Teardown
     cv2.destroyAllWindows()
@@ -1438,7 +1458,7 @@ def main() -> None:
     if obstacle_devices:
         obstacle_thread = threading.Thread(
             target=run_obstacle_detection,
-            args=(SERIAL_CONTROLLER, obstacle_devices, MODE_STATE),
+            args=(SERIAL_CONTROLLER, obstacle_devices, MODE_STATE, FRAME_HUB),
             daemon=True,
         )
         obstacle_thread.start()
