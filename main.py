@@ -46,7 +46,7 @@ FAN_ON_COMMAND = os.environ.get("FAN_ON_COMMAND", "FAN")
 FAN_OFF_COMMAND = os.environ.get("FAN_OFF_COMMAND", "STOP")
 LIFT_UP_COMMAND = os.environ.get("LIFT_UP_COMMAND", "UP")
 LIFT_DOWN_COMMAND = os.environ.get("LIFT_DOWN_COMMAND", "DOWN")
-#LIFT_STOP_COMMAND = os.environ.get("LIFT_STOP_COMMAND", "STOP")
+LIFT_STOP_COMMAND = os.environ.get("LIFT_STOP_COMMAND", "STOP")
 
 SerialResult = tuple[bool, str]
 
@@ -240,50 +240,6 @@ class ModeState:
             return True
 
 
-_DIRECTION_ALIAS = {
-    "forward": "FORWARD",
-    "fwd": "FORWARD",
-    "up": "FORWARD",
-    "start": "FORWARD",
-    "go": "FORWARD",
-    "back": "BACKWARD",
-    "backward": "BACKWARD",
-    "reverse": "BACKWARD",
-    "left": "LEFT",
-    "right": "RIGHT",
-    "stop": "STOP",
-    "halt": "STOP",
-    "idle": "STOP",
-}
-
-JOYSTICK_DEADZONE = float(os.environ.get("JOYSTICK_DEADZONE", "0.3"))
-
-
-def _command_from_direction(direction: Any) -> str | None:
-    if not isinstance(direction, str):
-        return None
-    normalized = direction.strip().lower()
-    if not normalized:
-        return None
-    return _DIRECTION_ALIAS.get(normalized)
-
-
-def _command_from_axes(x: float, y: float) -> str:
-    """Map analog joystick axes to discrete FORWARD/LEFT/RIGHT/STOP commands."""
-    magnitude = max(abs(x), abs(y))
-    if magnitude < JOYSTICK_DEADZONE:
-        return "STOP"
-
-    if abs(y) >= abs(x):
-        if y > 0:
-            return "FORWARD"
-        if y < 0:
-            return "BACKWARD"
-        return "STOP"
-
-    return "RIGHT" if x > 0 else "LEFT"
-
-
 # ======================================================================================
 # Frame Compositing + Streaming
 # ======================================================================================
@@ -396,40 +352,38 @@ def create_app(
             200 if ok else 502,
         )
 
-    @app.post("/api/drive/joystick")
-    def api_drive_joystick():
-        data = request.get_json(silent=True) or {}
-        direction = data.get("direction")
-        cmd = _command_from_direction(direction)
-        if cmd:
-            result = serial_controller.submit_drive_command(cmd)
-            if result is None:
-                return jsonify(error="drive queue busy", cmd=cmd), 503
-            ok, reply = result
-            return jsonify(status="ok" if ok else "err", cmd=cmd, serial=reply), 200 if ok else 502
-
-        x = data.get("x", data.get("horizontal", 0.0))
-        y = data.get("y", data.get("vertical", 0.0))
-        try:
-            x_f = float(x)
-            y_f = float(y)
-        except (TypeError, ValueError):
-            return jsonify(error="bad joystick payload"), 400
-
-        cmd = _command_from_axes(x_f, y_f)
-        result = serial_controller.submit_drive_command(cmd)
+    def _drive_command_response(command: str):
+        result = serial_controller.submit_drive_command(command)
         if result is None:
-            return jsonify(error="drive queue busy", cmd=cmd), 503
+            return jsonify(error="drive queue busy", command=command), 503
         ok, reply = result
-        return jsonify(status="ok" if ok else "err", cmd=cmd, serial=reply), 200 if ok else 502
+        status_code = 200 if ok else 502
+        payload = {
+            "command": command,
+            "status": "ok" if ok else "err",
+            "serial": reply,
+        }
+        return jsonify(payload), status_code
+
+    @app.post("/api/drive/forward")
+    def api_drive_forward():
+        return _drive_command_response("FORWARD")
+
+    @app.post("/api/drive/reverse")
+    def api_drive_reverse():
+        return _drive_command_response("BACKWARD")
+
+    @app.post("/api/drive/left")
+    def api_drive_left():
+        return _drive_command_response("LEFT")
+
+    @app.post("/api/drive/right")
+    def api_drive_right():
+        return _drive_command_response("RIGHT")
 
     @app.post("/api/drive/stop")
     def api_drive_stop():
-        result = serial_controller.submit_drive_command("STOP")
-        if result is None:
-            return jsonify(error="drive queue busy", cmd="STOP"), 503
-        ok, reply = result
-        return jsonify(status="stopped" if ok else "err", serial=reply), 200 if ok else 502
+        return _drive_command_response("STOP")
 
     def _simple_serial_endpoint(command: str):
         ok, reply = serial_controller.send(command)
@@ -443,9 +397,9 @@ def create_app(
     def api_lift_down():
         return _simple_serial_endpoint(LIFT_DOWN_COMMAND)
 
-#    @app.post("/api/lift/stop")
-#    def api_lift_stop():
-#        return _simple_serial_endpoint(LIFT_STOP_COMMAND)
+    @app.post("/api/lift/stop")
+    def api_lift_stop():
+        return _simple_serial_endpoint(LIFT_STOP_COMMAND)
 
     @app.post("/api/fan/on")
     def api_fan_on():
