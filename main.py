@@ -18,7 +18,7 @@ import uuid
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from queue import Full, Queue
+from queue import Empty, Full, Queue
 from typing import Any, Callable, Iterable
 
 import cv2
@@ -50,6 +50,14 @@ def _read_float_env(var_name: str, default: float) -> float:
         return default
 
 JOYSTICK_DEADZONE = _read_float_env("JOYSTICK_DEADZONE", 0.3)
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    value = str(os.environ.get(name, default)).strip().lower()
+    return value not in {"", "0", "false", "no", "off"}
+
+
+DRIVE_DEBUG_LOGS = _env_flag("DRIVE_DEBUG_LOGS")
 
 # Default actuator commands (override via env vars if firmware differs)
 FAN_ON_COMMAND = os.environ.get("FAN_ON_COMMAND", "FAN")
@@ -126,12 +134,48 @@ class SerialController:
 
         remaining = absolute_deadline - time.monotonic()
         if remaining <= 0:
-            return None
+                return None
 
         try:
             return future.result(timeout=remaining)
         except concurrent.futures.TimeoutError:
+            if DRIVE_DEBUG_LOGS:
+                snapshot = self.drive_queue_snapshot()
+                print(
+                    f"[DRIVE] Timeout waiting for job '{job.cmd}' "
+                    f"(queue_depth={snapshot['depth']}, worker_alive={snapshot['worker_alive']})"
+                )
             return None
+
+    def flush_drive_queue(self, reason: str | None = None) -> int:
+        """Drop all queued drive jobs, marking their futures as failed."""
+        dropped = 0
+        while True:
+            try:
+                job = self._drive_queue.get_nowait()
+            except Empty:
+                break
+            dropped += 1
+            if not job.future.done():
+                job.future.set_result(
+                    (
+                        False,
+                        reason or "Drive queue flushed",
+                    )
+                )
+            self._drive_queue.task_done()
+        if DRIVE_DEBUG_LOGS and dropped:
+            print(f"[DRIVE] Flushed {dropped} queued job(s): {reason or 'no reason provided'}")
+        return dropped
+
+    def drive_queue_snapshot(self) -> dict[str, Any]:
+        """Return lightweight telemetry for queue health."""
+        worker_alive = self._drive_worker_thread.is_alive() if self._drive_worker_thread else False
+        return {
+            "depth": self._drive_queue.qsize(),
+            "max_size": self._drive_queue.maxsize,
+            "worker_alive": worker_alive,
+        }
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -140,12 +184,24 @@ class SerialController:
         while True:
             job = self._drive_queue.get()
             try:
+                start = time.monotonic()
+                if DRIVE_DEBUG_LOGS:
+                    print(f"[DRIVE] Executing job {job.job_id}: {job.cmd}")
                 result = self.send(job.cmd)
                 if not job.future.done():
                     job.future.set_result(result)
+                if DRIVE_DEBUG_LOGS:
+                    duration_ms = (time.monotonic() - start) * 1000.0
+                    ok = result[0] if isinstance(result, tuple) and result else False
+                    print(
+                        f"[DRIVE] Job {job.job_id} complete (ok={ok}) "
+                        f"in {duration_ms:.1f} ms"
+                    )
             except Exception as exc:
                 if not job.future.done():
                     job.future.set_exception(exc)
+                if DRIVE_DEBUG_LOGS:
+                    print(f"[DRIVE] Job {job.job_id} failed: {exc}")
             finally:
                 self._drive_queue.task_done()
 
@@ -298,6 +354,9 @@ class ControlCommandDispatcher:
         if normalized not in self._DRIVE_COMMANDS:
             return self._error_result(f"Unsupported drive command '{command}'.")
 
+        if normalized == "STOP":
+            return self._handle_stop_command()
+
         result = self._serial.submit_drive_command(normalized)
         if result is None:
             return CommandDispatchResult(
@@ -305,6 +364,7 @@ class ControlCommandDispatcher:
                 {
                     "command": normalized,
                     "detail": "Drive queue busy",
+                    "queue": self._serial.drive_queue_snapshot(),
                 },
             )
 
@@ -400,6 +460,16 @@ class ControlCommandDispatcher:
             "topic": topic,
             "command": verb,
             "serial_reply": reply,
+        }
+        return CommandDispatchResult(200 if ok else 502, payload)
+
+    def _handle_stop_command(self) -> CommandDispatchResult:
+        flushed = self._serial.flush_drive_queue("STOP command preemption")
+        ok, reply = self._serial.send("STOP")
+        payload = {
+            "command": "STOP",
+            "serial_reply": reply,
+            "flushed_jobs": flushed,
         }
         return CommandDispatchResult(200 if ok else 502, payload)
 
