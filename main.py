@@ -11,7 +11,7 @@ import concurrent.futures
 import json
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 import threading
 import time
 import uuid
@@ -58,6 +58,11 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 
 DRIVE_DEBUG_LOGS = _env_flag("DRIVE_DEBUG_LOGS")
+
+
+def utc_now_iso(timespec: str = "seconds") -> str:
+    """Return an ISO 8601 UTC timestamp with a 'Z' suffix."""
+    return datetime.now(timezone.utc).isoformat(timespec=timespec).replace("+00:00", "Z")
 
 # Default actuator commands (override via env vars if firmware differs)
 FAN_ON_COMMAND = os.environ.get("FAN_ON_COMMAND", "FAN")
@@ -313,7 +318,7 @@ class CommandDispatchResult:
 
     def envelope(self, *, request_id: str | None = None, message_type: str | None = None) -> dict[str, Any]:
         data = dict(self.payload)
-        data.setdefault("timestamp", datetime.utcnow().isoformat(timespec="seconds") + "Z")
+        data.setdefault("timestamp", utc_now_iso("seconds"))
         data["status_code"] = self.status_code
         data["status"] = "ok" if self.status_code < 400 else "error"
         if request_id:
@@ -713,7 +718,7 @@ def create_app(
             {
                 "pests": summaries,
                 "total_tracked": len(summaries),
-                "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "generated_at": utc_now_iso("seconds"),
             }
         )
 
@@ -755,7 +760,7 @@ def create_app(
                     "session_id": session_id,
                     "mode": mode_state.get_mode(),
                     "status": "ok",
-                    "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                    "timestamp": utc_now_iso("seconds"),
                 }
             )
         )
@@ -782,7 +787,7 @@ def create_app(
                             "status": "error",
                             "status_code": 400,
                             "error": f"Invalid JSON: {exc}",
-                            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                            "timestamp": utc_now_iso("seconds"),
                         }
                     )
                 )
@@ -796,7 +801,7 @@ def create_app(
                             "status": "error",
                             "status_code": 400,
                             "error": "Payload must be a JSON object.",
-                            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                            "timestamp": utc_now_iso("seconds"),
                         }
                     )
                 )
@@ -1277,7 +1282,7 @@ class DetectionDatabase:
 
     @staticmethod
     def _utc_now() -> str:
-        return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+        return utc_now_iso("milliseconds")
 
 
 def partition_device_infos(
