@@ -43,6 +43,7 @@ python main.py
 - `opencv-contrib-python` – image transforms + ArUco detection.
 - `numpy` – lightweight frame math.
 - `Flask` – MJPEG streamer + REST endpoints for cameras, pests, and drive control.
+- `Flask-Sock` – upgrades the control surface to a WebSocket so long-lived clients (OkHttp, browser UIs) can stream commands.
 - `pyserial` – bridges joystick/actuator commands from HTTP into the Nano ESP32 firmware.
 
 ## DepthAI cameras and model blobs
@@ -58,15 +59,39 @@ Running `main.py` exposes both the MJPEG composite and JSON endpoints on `http:/
 - `GET /` – minimal HTML wrapper that just embeds `/video`.
 
 ### Drive + actuator control
-All endpoints respond with JSON and talk to the Arduino via `pyserial`.
+Manual drive commands now travel over a persistent WebSocket: `ws://<host>:5000/ws/control`. Every JSON message requires a `type` field so the dispatcher knows which subsystem to target, and the server replies with `status`, the raw `serial_reply`, and the current rover `mode`.
 
-- `POST /api/drive/joystick` – accepts `{"direction": "Forward"}` *or* `{"x": 0.3, "y": 0.9}` payloads. Directions map to the verbs accepted by `ManualControl.ino`; analog axes are quantized to FORWARD/BACKWARD/LEFT/RIGHT with a deadzone (tunable via `JOYSTICK_DEADZONE`, default 0.3).
-- `POST /api/drive/stop` – emergency STOP.
-- `POST /api/lift/up`, `/api/lift/down` – relays to `LIFT_UP_COMMAND`/`LIFT_DOWN_COMMAND` (override via env vars). A `lift/stop` placeholder already exists in `main.py` if you hook that motor up.
-- `POST /api/fan/on`, `/api/fan/off` – toggles auxiliary actuators using the customizable `FAN_*` command strings.
-- `POST /api/mode` – set the rover state to `manual` or `autonomous`; `GET /api/mode` returns the current mode so the Android app stays in sync.
+Common payloads:
 
-For every command the server returns whether the queue accepted the job and the raw serial response (so the client can show firmware errors).
+```json
+{"id":"demo-forward","type":"drive","command":"FORWARD"}
+{"id":"axes-1","type":"drive","x":0.15,"y":0.9}
+{"type":"lift","command":"up"}
+{"type":"fan","command":"off"}
+{"type":"mode","command":"set","value":"autonomous"}
+{"type":"mode","command":"get"}
+{"type":"status"}
+{"type":"ping"}
+```
+
+- `type: "drive"` accepts either a discrete `command` (`forward`, `backward`, `left`, `right`, `stop`) or joystick axes (`x` + `y`) that get quantized using the `JOYSTICK_DEADZONE` env var (default `0.3`).
+- `type: "lift"` maps `up`/`down`/`stop` into the `LIFT_*` serial verbs.
+- `type: "fan"` maps `on`/`off` into `FAN_ON_COMMAND`/`FAN_OFF_COMMAND`.
+- `type: "mode"` supports `{"command":"get"}` and `{"command":"set","value":"manual|autonomous"}`.
+- `type: "status"` probes `STAT?` on the Sabertooth and returns the latest rover mode.
+
+Legacy REST endpoints like `POST /api/drive/forward`, `/api/lift/up`, `/api/fan/on`, and `POST /api/mode` are still exposed for compatibility, but new tooling should prefer the WebSocket channel to avoid request-per-command latency spikes.
+
+### OkHttp control console
+Need a quick manual driver? The `app` module now includes a lightweight console that speaks the WebSocket protocol via OkHttp's `WebSocket` API. Launch it from the repo root with:
+
+```bash
+./gradlew :app:run --args="ws://127.0.0.1:5000/ws/control"
+```
+
+or export `CONTROL_WS_URL=ws://robot.local:5000/ws/control` and run `./gradlew :app:run`.
+
+Once connected you can type commands such as `drive forward`, `drive axes 0.2 0.9`, `lift down`, `fan on`, `mode set autonomous`, `status`, `ping`, `help`, or `quit`. Every server response is echoed with the JSON envelope so it's easy to see the serial acknowledgements.
 
 ### Pest summaries + status
 - `GET /api/pests` – ordered summary of `{label, count, last_seen_utc, last_seen_camera}` pulled from SQLite.

@@ -4,3 +4,4 @@ numpy==1.26.4
 opencv-contrib-python==4.10.0.84
 pyserial==3.5
 Flask==3.0.2
+Flask-Sock==0.7.0

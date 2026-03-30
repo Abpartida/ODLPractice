@@ -19,12 +19,14 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Full, Queue
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import cv2
 import depthai as dai
 import numpy as np
 from flask import Flask, Response, abort, jsonify, request
+from flask_sock import Sock
+from simple_websocket import ConnectionClosed
 import serial
 from serial import SerialException
 
@@ -40,6 +42,14 @@ SERIAL_TIMEOUT_SEC = float(os.environ.get("SERIAL_TIMEOUT_SEC", "0.25"))
 DRIVE_QUEUE_SIZE = int(os.environ.get("DRIVE_QUEUE_SIZE", "16"))
 DRIVE_HANDLER_DEADLINE_SEC = float(os.environ.get("DRIVE_HANDLER_DEADLINE_SEC", "0.2"))
 DRIVE_QUEUE_WAIT_FALLBACK_SEC = float(os.environ.get("DRIVE_QUEUE_WAIT_FALLBACK_SEC", "0.02"))
+
+def _read_float_env(var_name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(var_name, default))
+    except (TypeError, ValueError):
+        return default
+
+JOYSTICK_DEADZONE = _read_float_env("JOYSTICK_DEADZONE", 0.3)
 
 # Default actuator commands (override via env vars if firmware differs)
 FAN_ON_COMMAND = os.environ.get("FAN_ON_COMMAND", "FAN")
@@ -240,6 +250,236 @@ class ModeState:
             return True
 
 
+@dataclass(slots=True)
+class CommandDispatchResult:
+    status_code: int
+    payload: dict[str, Any]
+
+    def envelope(self, *, request_id: str | None = None, message_type: str | None = None) -> dict[str, Any]:
+        data = dict(self.payload)
+        data.setdefault("timestamp", datetime.utcnow().isoformat(timespec="seconds") + "Z")
+        data["status_code"] = self.status_code
+        data["status"] = "ok" if self.status_code < 400 else "error"
+        if request_id:
+            data["request_id"] = request_id
+        if message_type:
+            data.setdefault("type", message_type)
+        return data
+
+
+class ControlCommandDispatcher:
+    """Shared command processor for HTTP + WebSocket control surfaces."""
+
+    _DRIVE_COMMANDS = {"FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP"}
+
+    def __init__(
+        self,
+        serial_controller: SerialController,
+        mode_state: ModeState,
+        joystick_deadzone: float = JOYSTICK_DEADZONE,
+    ) -> None:
+        self._serial = serial_controller
+        self._mode = mode_state
+        self._deadzone = joystick_deadzone
+        self._ws_handlers: dict[str, Callable[[dict[str, Any]], CommandDispatchResult]] = {
+            "drive": self._ws_drive,
+            "lift": self._ws_lift,
+            "fan": self._ws_fan,
+            "mode": self._ws_mode,
+            "status": self._ws_status,
+            "ping": self._ws_ping,
+        }
+
+    # ------------------------------------------------------------------
+    # Public helpers for HTTP endpoints
+    # ------------------------------------------------------------------
+    def execute_drive_command(self, command: str) -> CommandDispatchResult:
+        normalized = self._normalize_keyword(command)
+        if normalized not in self._DRIVE_COMMANDS:
+            return self._error_result(f"Unsupported drive command '{command}'.")
+
+        result = self._serial.submit_drive_command(normalized)
+        if result is None:
+            return CommandDispatchResult(
+                503,
+                {
+                    "command": normalized,
+                    "detail": "Drive queue busy",
+                },
+            )
+
+        ok, reply = result
+        return CommandDispatchResult(
+            200 if ok else 502,
+            {
+                "command": normalized,
+                "serial_reply": reply,
+            },
+        )
+
+    def execute_drive_from_axes(self, x: float, y: float) -> CommandDispatchResult:
+        command = self._reduce_axes_to_command(x, y)
+        response = self.execute_drive_command(command)
+        response.payload.setdefault("joystick", {"x": x, "y": y})
+        return response
+
+    def execute_lift_command(self, verb: str) -> CommandDispatchResult:
+        mapping = {
+            "UP": LIFT_UP_COMMAND,
+            "DOWN": LIFT_DOWN_COMMAND,
+            "STOP": LIFT_STOP_COMMAND,
+        }
+        normalized = self._normalize_keyword(verb)
+        if normalized not in mapping:
+            return self._error_result("Lift command must be one of: up, down, stop.")
+        return self._send_simple(mapping[normalized], topic="lift", verb=normalized)
+
+    def execute_fan_command(self, verb: str) -> CommandDispatchResult:
+        normalized = self._normalize_keyword(verb)
+        if normalized not in {"ON", "OFF"}:
+            return self._error_result("Fan command must be 'on' or 'off'.")
+        command = FAN_ON_COMMAND if normalized == "ON" else FAN_OFF_COMMAND
+        return self._send_simple(command, topic="fan", verb=normalized)
+
+    def get_mode_response(self) -> CommandDispatchResult:
+        return CommandDispatchResult(200, {"mode": self._mode.get_mode()})
+
+    def set_mode_response(self, value: str) -> CommandDispatchResult:
+        if not isinstance(value, str):
+            return self._error_result("Mode must be provided as a string.")
+        try:
+            changed = self._mode.set_mode(value)
+        except ValueError as exc:
+            return self._error_result(str(exc))
+        return CommandDispatchResult(200, {"mode": self._mode.get_mode(), "changed": changed})
+
+    def status_probe(self) -> CommandDispatchResult:
+        ok, reply = self._serial.send("STAT?")
+        return CommandDispatchResult(
+            200 if ok else 502,
+            {
+                "system_status": "Nominal" if ok else "Degraded",
+                "serial": reply,
+                "mode": self._mode.get_mode(),
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # WebSocket dispatcher
+    # ------------------------------------------------------------------
+    def dispatch_ws_message(
+        self,
+        message: dict[str, Any],
+        *,
+        fallback_request_id: str | None = None,
+    ) -> dict[str, Any]:
+        request_id = str(message.get("request_id") or message.get("id") or fallback_request_id or uuid.uuid4().hex[:10])
+        msg_type = str(message.get("type") or "").strip().lower()
+        if not msg_type:
+            result = self._error_result("Message 'type' is required.")
+            msg_type = "error"
+        else:
+            handler = self._ws_handlers.get(msg_type)
+            if handler is None:
+                result = self._error_result(f"Unsupported message type '{msg_type}'.")
+                msg_type = "error"
+            else:
+                try:
+                    result = handler(message)
+                except Exception as exc:  # pragma: no cover - defensive guard for runtime errors
+                    result = self._error_result(f"{msg_type} handler failed: {exc}", status_code=500)
+                    msg_type = "error"
+        return result.envelope(request_id=request_id, message_type=msg_type)
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+    def _send_simple(self, command: str, *, topic: str, verb: str) -> CommandDispatchResult:
+        ok, reply = self._serial.send(command)
+        payload = {
+            "topic": topic,
+            "command": verb,
+            "serial_reply": reply,
+        }
+        return CommandDispatchResult(200 if ok else 502, payload)
+
+    def _normalize_keyword(self, value: str) -> str:
+        if not isinstance(value, str):
+            return ""
+        return value.strip().upper()
+
+    def _reduce_axes_to_command(self, x: float, y: float) -> str:
+        x_adj = x if abs(x) >= self._deadzone else 0.0
+        y_adj = y if abs(y) >= self._deadzone else 0.0
+        if abs(y_adj) >= abs(x_adj) and y_adj > 0:
+            return "FORWARD"
+        if abs(y_adj) >= abs(x_adj) and y_adj < 0:
+            return "BACKWARD"
+        if x_adj > 0:
+            return "RIGHT"
+        if x_adj < 0:
+            return "LEFT"
+        return "STOP"
+
+    def _coerce_float(self, value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _error_result(self, message: str, status_code: int = 400) -> CommandDispatchResult:
+        return CommandDispatchResult(status_code, {"error": message})
+
+    def _ws_drive(self, payload: dict[str, Any]) -> CommandDispatchResult:
+        command = payload.get("command") or payload.get("direction") or payload.get("action")
+        if isinstance(command, str) and command.strip():
+            return self.execute_drive_command(command)
+
+        axes = payload.get("axes")
+        ax = ay = None
+        if isinstance(axes, dict):
+            ax = self._coerce_float(axes.get("x"))
+            ay = self._coerce_float(axes.get("y"))
+        if ax is None:
+            ax = self._coerce_float(payload.get("x"))
+        if ay is None:
+            ay = self._coerce_float(payload.get("y"))
+
+        if ax is None and ay is None:
+            return self._error_result("Drive command requires 'command' or joystick axes (x/y).")
+
+        return self.execute_drive_from_axes(ax or 0.0, ay or 0.0)
+
+    def _ws_lift(self, payload: dict[str, Any]) -> CommandDispatchResult:
+        verb = payload.get("command") or payload.get("action")
+        if not isinstance(verb, str):
+            return self._error_result("Lift messages must include a 'command'.")
+        return self.execute_lift_command(verb)
+
+    def _ws_fan(self, payload: dict[str, Any]) -> CommandDispatchResult:
+        verb = payload.get("command") or payload.get("state")
+        if not isinstance(verb, str):
+            return self._error_result("Fan messages must include 'command' or 'state'.")
+        return self.execute_fan_command(verb)
+
+    def _ws_mode(self, payload: dict[str, Any]) -> CommandDispatchResult:
+        action = str(payload.get("command") or payload.get("action") or "get").lower()
+        if action in {"set", "update"}:
+            return self.set_mode_response(payload.get("value"))
+        return self.get_mode_response()
+
+    def _ws_status(self, payload: dict[str, Any]) -> CommandDispatchResult:
+        return self.status_probe()
+
+    def _ws_ping(self, payload: dict[str, Any]) -> CommandDispatchResult:
+        return CommandDispatchResult(
+            200,
+            {
+                "message": "pong",
+                "mode": self._mode.get_mode(),
+            },
+        )
+
 # ======================================================================================
 # Frame Compositing + Streaming
 # ======================================================================================
@@ -339,6 +579,11 @@ def create_app(
     db: DetectionDatabase,
 ) -> Flask:
     app = Flask(__name__)
+    sock = Sock(app)
+    dispatcher = ControlCommandDispatcher(serial_controller, mode_state)
+
+    def _json_response(result: CommandDispatchResult):
+        return jsonify(result.payload), result.status_code
 
     @app.post("/auth/login")
     def auth_login():
@@ -346,24 +591,10 @@ def create_app(
 
     @app.get("/status")
     def status():
-        ok, reply = serial_controller.send("STAT?")
-        return (
-            jsonify(system_status="Nominal" if ok else "Degraded", serial=reply),
-            200 if ok else 502,
-        )
+        return _json_response(dispatcher.status_probe())
 
     def _drive_command_response(command: str):
-        result = serial_controller.submit_drive_command(command)
-        if result is None:
-            return jsonify(error="drive queue busy", command=command), 503
-        ok, reply = result
-        status_code = 200 if ok else 502
-        payload = {
-            "command": command,
-            "status": "ok" if ok else "err",
-            "serial": reply,
-        }
-        return jsonify(payload), status_code
+        return _json_response(dispatcher.execute_drive_command(command))
 
     @app.post("/api/drive/forward")
     def api_drive_forward():
@@ -385,29 +616,25 @@ def create_app(
     def api_drive_stop():
         return _drive_command_response("STOP")
 
-    def _simple_serial_endpoint(command: str):
-        ok, reply = serial_controller.send(command)
-        return jsonify(ok=ok, command=command, reply=reply), 200 if ok else 502
-
     @app.post("/api/lift/up")
     def api_lift_up():
-        return _simple_serial_endpoint(LIFT_UP_COMMAND)
+        return _json_response(dispatcher.execute_lift_command("UP"))
 
     @app.post("/api/lift/down")
     def api_lift_down():
-        return _simple_serial_endpoint(LIFT_DOWN_COMMAND)
+        return _json_response(dispatcher.execute_lift_command("DOWN"))
 
     @app.post("/api/lift/stop")
     def api_lift_stop():
-        return _simple_serial_endpoint(LIFT_STOP_COMMAND)
+        return _json_response(dispatcher.execute_lift_command("STOP"))
 
     @app.post("/api/fan/on")
     def api_fan_on():
-        return _simple_serial_endpoint(FAN_ON_COMMAND)
+        return _json_response(dispatcher.execute_fan_command("ON"))
 
     @app.post("/api/fan/off")
     def api_fan_off():
-        return _simple_serial_endpoint(FAN_OFF_COMMAND)
+        return _json_response(dispatcher.execute_fan_command("OFF"))
 
     @app.get("/api/pests")
     def api_list_pests():
@@ -432,19 +659,13 @@ def create_app(
 
     @app.get("/api/mode")
     def api_get_mode():
-        return jsonify(mode=mode_state.get_mode()), 200
+        return _json_response(dispatcher.get_mode_response())
 
     @app.post("/api/mode")
     def api_set_mode():
         data = request.get_json(silent=True) or {}
         requested_mode = data.get("mode")
-        if not isinstance(requested_mode, str):
-            return jsonify(error="mode must be provided as a string"), 400
-        try:
-            changed = mode_state.set_mode(requested_mode)
-        except ValueError as exc:
-            return jsonify(error=str(exc)), 400
-        return jsonify(mode=mode_state.get_mode(), changed=changed), 200
+        return _json_response(dispatcher.set_mode_response(requested_mode))
 
     @app.route("/video")
     def video():
@@ -453,6 +674,66 @@ def create_app(
     @app.route("/")
     def index():
         return "<h1>Live Stream</h1><img src=\"/video\"/>"
+
+    @sock.route("/ws/control")
+    def control_websocket(ws):
+        session_id = uuid.uuid4().hex[:10]
+        ws.send(
+            json.dumps(
+                {
+                    "type": "welcome",
+                    "session_id": session_id,
+                    "mode": mode_state.get_mode(),
+                    "status": "ok",
+                    "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                }
+            )
+        )
+        while True:
+            try:
+                raw_message = ws.receive()
+            except ConnectionClosed:
+                break
+            if raw_message is None:
+                break
+
+            if isinstance(raw_message, bytes):
+                raw_text = raw_message.decode("utf-8", errors="ignore")
+            else:
+                raw_text = raw_message
+
+            try:
+                payload = json.loads(raw_text)
+            except json.JSONDecodeError as exc:
+                ws.send(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "status": "error",
+                            "status_code": 400,
+                            "error": f"Invalid JSON: {exc}",
+                            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                        }
+                    )
+                )
+                continue
+
+            if not isinstance(payload, dict):
+                ws.send(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "status": "error",
+                            "status_code": 400,
+                            "error": "Payload must be a JSON object.",
+                            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                        }
+                    )
+                )
+                continue
+
+            response = dispatcher.dispatch_ws_message(payload)
+            ws.send(json.dumps(response))
 
     return app
 
