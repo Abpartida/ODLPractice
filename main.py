@@ -49,6 +49,20 @@ def _read_float_env(var_name: str, default: float) -> float:
     except (TypeError, ValueError):
         return default
 
+
+def _read_int_env(var_name: str, default: int, *, minimum: int | None = None) -> int:
+    raw_value = os.environ.get(var_name)
+    if raw_value is None:
+        return default
+    try:
+        parsed = int(raw_value)
+    except (TypeError, ValueError):
+        print(f"[WARN] Invalid integer for {var_name}='{raw_value}'. Using default ({default}).")
+        return default
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    return parsed
+
 JOYSTICK_DEADZONE = _read_float_env("JOYSTICK_DEADZONE", 0.3)
 
 
@@ -1365,6 +1379,12 @@ def partition_device_infos(
             f"[WARN] Requested {obstacle_count} obstacle cameras but only {len(obstacle_devices)} device(s) allocated."
         )
 
+    print(
+        "[INFO] Camera allocation:"
+        f" pest={len(pest_devices)}/{pest_count}"
+        f" obstacle={len(obstacle_devices)}/{obstacle_count}"
+    )
+
     return pest_devices, obstacle_devices
 
 
@@ -1840,7 +1860,12 @@ app = create_app(SERIAL_CONTROLLER, FRAME_HUB, MODE_STATE, DETECTION_DB, DRIVE_H
 
 def main() -> None:
     all_device_infos = dai.Device.getAllAvailableDevices()
-    pest_devices, obstacle_devices = partition_device_infos(all_device_infos)
+    default_pest = len(all_device_infos) if all_device_infos else 1
+    pest_count = _read_int_env("PEST_CAMERA_COUNT", default_pest, minimum=0)
+    obstacle_count = _read_int_env("OBSTACLE_CAMERA_COUNT", 0, minimum=0)
+    if pest_count == 0 and obstacle_count == 0:
+        pest_count = default_pest
+    pest_devices, obstacle_devices = partition_device_infos(all_device_infos, pest_count, obstacle_count)
 
     if pest_devices:
         pipeline_thread = threading.Thread(
