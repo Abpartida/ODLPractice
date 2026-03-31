@@ -753,6 +753,7 @@ def create_app(
     @sock.route("/ws/control")
     def control_websocket(ws):
         session_id = uuid.uuid4().hex[:10]
+        print(f"[WS] session {session_id} connected")
         ws.send(
             json.dumps(
                 {
@@ -809,6 +810,7 @@ def create_app(
 
             response = dispatcher.dispatch_ws_message(payload)
             ws.send(json.dumps(response))
+        print(f"[WS] session {session_id} disconnected")
 
     return app
 
