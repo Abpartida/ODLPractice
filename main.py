@@ -809,6 +809,14 @@ def create_app(
                 continue
 
             response = dispatcher.dispatch_ws_message(payload)
+            msg_type = str(payload.get("type") or "").strip().lower()
+            if msg_type == "drive":
+                command = response.get("command") or payload.get("command")
+                status = response.get("status")
+                status_code = response.get("status_code")
+                print(
+                    f"[WS] session {session_id} drive cmd={command} status={status} code={status_code}"
+                )
             ws.send(json.dumps(response))
         print(f"[WS] session {session_id} disconnected")
 
