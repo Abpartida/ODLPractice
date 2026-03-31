@@ -1642,28 +1642,49 @@ def run_obstacle_detection(
 
         # Initialize connected DepthAI devices
         for i, info in enumerate(device_infos):
-            device = stack.enter_context(dai.Device(info))
-            pipeline = stack.enter_context(dai.Pipeline(device))
+            pipeline = dai.Pipeline()
 
             # Configure stereo and RGB nodes
-            left = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
-            right = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
-            rgb_cam = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
+            left = pipeline.create(dai.node.MonoCamera)
+            left.setBoardSocket(dai.CameraBoardSocket.LEFT)
+            left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+            left.setFps(30)
 
-            rgb_out = rgb_cam.requestOutput((640, 480), dai.ImgFrame.Type.BGR888p)
+            right = pipeline.create(dai.node.MonoCamera)
+            right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
+            right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+            right.setFps(30)
+
+            rgb_cam = pipeline.create(dai.node.ColorCamera)
+            rgb_cam.setBoardSocket(dai.CameraBoardSocket.RGB)
+            rgb_cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+            rgb_cam.setPreviewSize(640, 480)
+            rgb_cam.setInterleaved(False)
+            rgb_cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
 
             stereo = pipeline.create(dai.node.StereoDepth)
             stereo.setLeftRightCheck(True)
             stereo.setSubpixel(False)
+            stereo.setDepthAlign(dai.CameraBoardSocket.RGB)
 
-            left.requestOutput((640, 400)).link(stereo.left)
-            right.requestOutput((640, 400)).link(stereo.right)
+            left.out.link(stereo.left)
+            right.out.link(stereo.right)
+
+            rgb_xout = pipeline.create(dai.node.XLinkOut)
+            depth_xout = pipeline.create(dai.node.XLinkOut)
+            rgb_stream_name = f"obstacle_rgb_{i}"
+            depth_stream_name = f"obstacle_depth_{i}"
+            rgb_xout.setStreamName(rgb_stream_name)
+            depth_xout.setStreamName(depth_stream_name)
+
+            rgb_cam.preview.link(rgb_xout.input)
+            stereo.depth.link(depth_xout.input)
+
+            device = stack.enter_context(dai.Device(pipeline, info))
 
             # Instantiate device-scoped non-blocking queues prior to pipeline execution
-            rgb_qs.append(rgb_out.createOutputQueue(maxSize=4, blocking=False))
-            depth_qs.append(stereo.depth.createOutputQueue(maxSize=4, blocking=False))
-
-            pipeline.start()
+            rgb_qs.append(device.getOutputQueue(rgb_stream_name, maxSize=4, blocking=False))
+            depth_qs.append(device.getOutputQueue(depth_stream_name, maxSize=4, blocking=False))
 
             print(f"Pipeline active for Device {i} [ID: {info.getDeviceId()}]")
             time.sleep(0.2)  # Hardware stabilization delay
