@@ -1604,7 +1604,6 @@ def run_obstacle_detection(
 
     FPS_LIMIT = 30
     should_quit = False
-    MANUAL_WAIT_INTERVAL_SEC = 0.25
 
     # System Parameters & Constraints
     SAFE_DISTANCE_MM = 300
@@ -1675,12 +1674,10 @@ def run_obstacle_detection(
         last_command_sent: bytes | None = None
 
         while not should_quit:
-            if mode_state is not None and not mode_state.is_autonomous():
-                if esp32 and last_command_sent != b"STOP\n":
-                    esp32.write(b"STOP\n")
-                    last_command_sent = b"STOP\n"
-                mode_state.wait_for_mode(ModeState.AUTONOMOUS, timeout=MANUAL_WAIT_INTERVAL_SEC)
-                continue
+            is_autonomous = mode_state.is_autonomous() if mode_state is not None else True
+            if not is_autonomous and esp32 and last_command_sent != b"STOP\n":
+                esp32.write(b"STOP\n")
+                last_command_sent = b"STOP\n"
 
             current_time = time.time()
             if current_time - last_frame_time < (1.0 / FPS_LIMIT):
@@ -1813,7 +1810,7 @@ def run_obstacle_detection(
                             else:
                                 status = "END OF TAPE. STOPPED."
 
-                    if esp32:
+                    if esp32 and is_autonomous:
                         if command_to_send != last_command_sent:
                             esp32.write(command_to_send)
                             last_command_sent = command_to_send
@@ -1877,15 +1874,15 @@ def main() -> None:
     else:
         print("[WARN] Skipping pest identification pipeline due to missing devices.")
 
-    if obstacle_devices and MODE_STATE.is_autonomous():
+    if obstacle_devices:
+        if not MODE_STATE.is_autonomous():
+            print("[INFO] Obstacle cameras active in passive mode until autonomous mode is enabled.")
         obstacle_thread = threading.Thread(
             target=run_obstacle_detection,
             args=(SERIAL_CONTROLLER, obstacle_devices, MODE_STATE, FRAME_HUB),
             daemon=True,
         )
         obstacle_thread.start()
-    elif obstacle_devices:
-        print("[INFO] Skipping obstacle detection until mode switches to autonomous.")
     else:
         print("[WARN] Skipping obstacle detection due to missing dedicated devices.")
 
