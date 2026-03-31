@@ -57,7 +57,7 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return value not in {"", "0", "false", "no", "off"}
 
 
-DRIVE_DEBUG_LOGS = _env_flag("DRIVE_DEBUG_LOGS")
+DRIVE_DEBUG_LOGS = _env_flag("DRIVE_DEBUG_LOGS", "1")
 
 
 def utc_now_iso(timespec: str = "seconds") -> str:
@@ -814,8 +814,10 @@ def create_app(
                 command = response.get("command") or payload.get("command")
                 status = response.get("status")
                 status_code = response.get("status_code")
+                serial_reply = response.get("serial_reply")
                 print(
-                    f"[WS] session {session_id} drive cmd={command} status={status} code={status_code}"
+                    f"[WS] session {session_id} drive cmd={command} status={status} "
+                    f"code={status_code} serial={serial_reply}"
                 )
             ws.send(json.dumps(response))
         print(f"[WS] session {session_id} disconnected")
