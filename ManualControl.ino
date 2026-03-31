@@ -19,7 +19,7 @@ int lidarState = 0;
 unsigned long lidarTimer = 0;
 
 // Set to 10 seconds for Line Following deduplication
-const unsigned long WATCHDOG_TIMEOUT = 500; 
+const unsigned long WATCHDOG_TIMEOUT = ULONG_MAX; 
 
 const int DRIVE_SPEED = 127;
 const int TURN_SPEED  = 63;
