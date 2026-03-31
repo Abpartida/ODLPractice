@@ -1381,19 +1381,42 @@ def start_pipeline(
         raise RuntimeError("DEFAULT_MODEL_BLOB is not set; ensure RESULT_DIR points to a valid export.")
 
     model_blob_path = str(DEFAULT_MODEL_BLOB)
+
+    available_devices = device_infos_override if device_infos_override is not None else dai.Device.getAllAvailableDevices()
+    if not available_devices:
+        raise RuntimeError("[ERROR] No DepthAI devices detected.")
+
+    requested_camera_count = len(available_devices)
+    camera_count_env = os.environ.get("PIPELINE_CAMERA_COUNT")
+    if camera_count_env:
+        try:
+            requested_camera_count = max(1, int(camera_count_env))
+        except ValueError:
+            print(
+                f"[WARN] Invalid PIPELINE_CAMERA_COUNT='{camera_count_env}'. Defaulting to {len(available_devices)} devices."
+            )
+            requested_camera_count = len(available_devices)
+
+    if requested_camera_count > len(available_devices):
+        print(
+            f"[WARN] Requested {requested_camera_count} camera(s) but only {len(available_devices)} device(s) detected. "
+            "Proceeding with available devices."
+        )
+
+    camera_names = {
+        0: "camera_1_left",
+        1: "camera_2_right",
+    }
+    active_camera_count = min(requested_camera_count, len(available_devices))
     camera_setups = [
-        CameraSetup(name="camera_1_left", blob_path=model_blob_path),
-        CameraSetup(name="camera_2_right", blob_path=model_blob_path),
+        CameraSetup(name=camera_names.get(idx, f"camera_{idx + 1}"), blob_path=model_blob_path)
+        for idx in range(active_camera_count)
     ]
 
     pipeline_bundles: list[PipelineBundle] = []
     for setup in camera_setups:
         bundle = build_pipeline(setup)
         pipeline_bundles.append(bundle)
-
-    available_devices = device_infos_override if device_infos_override is not None else dai.Device.getAllAvailableDevices()
-    if not available_devices:
-        raise RuntimeError("[ERROR] No DepthAI devices detected.")
 
     if len(available_devices) < len(pipeline_bundles):
         print(
