@@ -40,7 +40,7 @@ SERIAL_BAUD = int(os.environ.get("SERIAL_BAUD", "115200"))
 SERIAL_TIMEOUT_SEC = float(os.environ.get("SERIAL_TIMEOUT_SEC", "0.25"))
 
 DRIVE_QUEUE_SIZE = int(os.environ.get("DRIVE_QUEUE_SIZE", "16"))
-DRIVE_HANDLER_DEADLINE_SEC = float(os.environ.get("DRIVE_HANDLER_DEADLINE_SEC", "0.2"))
+DRIVE_HANDLER_DEADLINE_SEC = float(os.environ.get("DRIVE_HANDLER_DEADLINE_SEC", "3.0"))
 DRIVE_QUEUE_WAIT_FALLBACK_SEC = float(os.environ.get("DRIVE_QUEUE_WAIT_FALLBACK_SEC", "0.02"))
 
 def _read_float_env(var_name: str, default: float) -> float:
@@ -1467,8 +1467,9 @@ def start_pipeline(
                     2,
                 )
                 if trap_ids_in_view:
-                    print("[ACTION] Turn Off systems")
-                    print(f"[METRIC] Unique traps seen so far: {len(unique_traps_seen)}")
+                    print()
+                    #print("[ACTION] Turn Off systems")
+                    #print(f"[METRIC] Unique traps seen so far: {len(unique_traps_seen)}")
 
             # COMMIT DATABASE EVERY 5 SECONDS
             previous_commit = last_commit
@@ -1775,13 +1776,15 @@ def main() -> None:
     else:
         print("[WARN] Skipping pest identification pipeline due to missing devices.")
 
-    if obstacle_devices:
+    if obstacle_devices and MODE_STATE.is_autonomous():
         obstacle_thread = threading.Thread(
             target=run_obstacle_detection,
             args=(SERIAL_CONTROLLER, obstacle_devices, MODE_STATE, FRAME_HUB),
             daemon=True,
         )
         obstacle_thread.start()
+    elif obstacle_devices:
+        print("[INFO] Skipping obstacle detection until mode switches to autonomous.")
     else:
         print("[WARN] Skipping obstacle detection due to missing dedicated devices.")
 
