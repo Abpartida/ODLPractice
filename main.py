@@ -1933,8 +1933,8 @@ def run_obstacle_detection(
             if not nav_enabled:
                 is_adjusting_height = False
 
-            if esp32 and not allowed_now:
-                if not stop_latched:
+            if not nav_enabled:
+                if esp32 and not stop_latched:
                     try:
                         esp32.write(b"STOP\n")
                     except Exception:
@@ -2068,7 +2068,6 @@ def run_obstacle_detection(
 
                     if not nav_enabled:
                         status = nav_wait_reason or "Obstacle loop idle"
-                        send_drive_command(b"STOP\n")
                         heights_tuple = height_state.get_heights() if height_state else None
                         if heights_tuple:
                             height_text = f"Heights: {heights_tuple[0]:.1f}-{heights_tuple[1]:.1f}ft"
