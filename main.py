@@ -1917,7 +1917,19 @@ def run_obstacle_detection(
         stop_latched = False
 
         while not should_quit:
+            heights_ready_now = heights_ready()
+            autonomous_mode = mode_state.is_autonomous() if mode_state is not None else True
+            nav_enabled = heights_ready_now and autonomous_mode
+            nav_wait_reason = None
+            if not heights_ready_now:
+                nav_wait_reason = "Waiting for height input"
+            elif not autonomous_mode:
+                nav_wait_reason = "Waiting for autonomous mode"
+
             allowed_now = actuation_allowed()
+            if not nav_enabled:
+                is_adjusting_height = False
+
             if esp32 and not allowed_now:
                 if not stop_latched:
                     try:
@@ -2050,6 +2062,29 @@ def run_obstacle_detection(
                                     (0, 255, 0),
                                     3,
                                 )
+
+                    if not nav_enabled:
+                        status = nav_wait_reason or "Obstacle loop idle"
+                        send_drive_command(b"STOP\n")
+                        heights_tuple = height_state.get_heights() if height_state else None
+                        if heights_tuple:
+                            height_text = (
+                                f"Heights: {heights_tuple[0]:.0f}-{heights_tuple[1]:.0f}mm"
+                            )
+                        else:
+                            height_text = "Heights: --"
+                        cam_label = "FRONT CAM" if active_cam_idx == FRONT_CAM_INDEX else "REAR CAM"
+                        cv2.putText(rgb_frame, cam_label, (450, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
+                        cv2.putText(rgb_frame, target_color_text, (450, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                        cv2.putText(rgb_frame, status, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
+                        cv2.putText(rgb_frame, height_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                        if GUI_AVAILABLE:
+                            cv2.imshow("Robot View", rgb_frame)
+                            if cv2.waitKey(1) & 0xFF == ord("q"):
+                                should_quit = True
+                        if frame_hub is not None:
+                            frame_hub.update(camera_labels[i], rgb_frame)
+                        continue
 
                     command_to_send = b"STOP\n"
                     status = ""
