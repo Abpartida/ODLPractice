@@ -113,6 +113,7 @@ class SerialController:
         self._serial: serial.Serial | None = None
         self._drive_queue: "Queue[SerialJob]" = Queue(maxsize=DRIVE_QUEUE_SIZE)
         self._drive_worker_thread: threading.Thread | None = None
+        self._rx_flush_since_write = True
 
     # ------------------------------------------------------------------
     # Public API
@@ -124,10 +125,16 @@ class SerialController:
             if self._serial is None or not self._serial.is_open:
                 return False, "Serial not connected"
 
+            # Drop any pending RX bytes so the ESP32 never blocks waiting for us to
+            # read its acknowledgements. A backed-up RX buffer manifests as write
+            # timeouts that make drive commands feel sluggish.
+            if not self._rx_flush_since_write:
+                self._reset_serial_input_unlocked()
             try:
                 payload = (cmd.strip() + "\n").encode("utf-8")
                 self._serial.write(payload)
                 self._serial.flush()
+                self._rx_flush_since_write = False
                 return True, "sent"
             except (SerialException, OSError) as exc:
                 try:
@@ -253,11 +260,18 @@ class SerialController:
             time.sleep(2.3)  # allow board reset + boot chatter
             try:
                 self._serial.reset_input_buffer()
+                self._rx_flush_since_write = True
             except Exception:
                 pass
         except SerialException as exc:
             self._serial = None
             print(f"[ERROR] Failed to open serial {self.port}: {exc}")
+
+    def reset_input_buffer(self) -> None:
+        """Public hook so other components can flush stale serial data."""
+        with self._serial_lock:
+            self._reset_serial_input_unlocked()
+            self._rx_flush_since_write = True
 
 
 class DriveHeartbeat:
@@ -312,7 +326,8 @@ class SerialWriterAdapter:
             self._controller.send(command)
 
     def reset_input_buffer(self) -> None:  # pragma: no cover - compatibility shim
-        return
+        if self._controller:
+            self._controller.reset_input_buffer()
 
     def close(self) -> None:  # pragma: no cover - noop shim
         return
