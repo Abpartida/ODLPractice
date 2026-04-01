@@ -1904,7 +1904,11 @@ def run_obstacle_detection(
             rgb_qs.append(device.getOutputQueue(rgb_stream_name, maxSize=4, blocking=False))
             depth_qs.append(device.getOutputQueue(depth_stream_name, maxSize=4, blocking=False))
 
-            print(f"Pipeline active for Device {i} [ID: {info.getDeviceId()}]")
+            try:
+                device_id = info.getMxId()
+            except AttributeError:
+                device_id = getattr(info, "mxid", "unknown")
+            print(f"Pipeline active for Device {i} [ID: {device_id}]")
             time.sleep(0.2)
 
         print("\nSystem active. Awaiting user interrupt (q).")
