@@ -2097,118 +2097,118 @@ def run_obstacle_detection(
                         frame_hub.update(camera_labels[i], rgb_frame)
                     continue
 
-                nav_enabled_prev = nav_enabled
+                    nav_enabled_prev = nav_enabled
 
-                command_to_send = b"STOP\n"
-                status = ""
-                lift_status: str | None = None
-
-                adjusting_now = bool(
-                    is_adjusting_height and actuation_allowed() and target_height_ft is not None
-                )
-
-                if adjusting_now:
-                    tgt_ft = target_height_ft if target_height_ft is not None else lower_height_ft
-                    lift_status = f"Lifting to {tgt_ft:.2f}ft"
                     command_to_send = b"STOP\n"
-                    if lidar_available and current_height_ft is not None:
-                        if current_height_ft < tgt_ft - height_tolerance_ft:
-                            _send_lift_command(LIFT_UP_COMMAND)
-                        elif current_height_ft > tgt_ft + height_tolerance_ft:
-                            _send_lift_command(LIFT_DOWN_COMMAND)
-                        else:
-                            _send_lift_command(LIFT_STOP_COMMAND)
-                            is_adjusting_height = False
-                            estimated_height_ft = tgt_ft
-                    else:
-                        if estimated_height_ft is None:
-                            estimated_height_ft = lower_height_ft
-                        distance_ft = abs(tgt_ft - estimated_height_ft)
-                        if distance_ft <= height_tolerance_ft:
-                            _send_lift_command(LIFT_STOP_COMMAND)
-                            is_adjusting_height = False
-                            estimated_height_ft = tgt_ft
-                        else:
-                            speed_ft = max(LIFT_SPEED_FT_PER_SEC, 0.01)
-                            duration_sec = distance_ft / speed_ft
-                            duration_sec = max(LIFT_MOVE_MIN_SEC, min(LIFT_MOVE_MAX_SEC, duration_sec))
-                            direction_cmd = LIFT_UP_COMMAND if tgt_ft > estimated_height_ft else LIFT_DOWN_COMMAND
-                            _cancel_lift_timer()
-                            _write_ascii_command(direction_cmd)
-                            _schedule_lift_stop(duration_sec)
-                            estimated_height_ft = tgt_ft
-                            is_adjusting_height = False
-                            lift_status = f"Lifting to {tgt_ft:.2f}ft (timed)"
-                else:
-                    if not is_adjusting_height:
-                        _send_lift_command(LIFT_STOP_COMMAND)
+                    status = ""
+                    lift_status: str | None = None
 
-                    if 0 < distance < SAFE_DISTANCE_MM:
-                        status = "STOP! OBSTACLE"
+                    adjusting_now = bool(
+                        is_adjusting_height and actuation_allowed() and target_height_ft is not None
+                    )
+
+                    if adjusting_now:
+                        tgt_ft = target_height_ft if target_height_ft is not None else lower_height_ft
+                        lift_status = f"Lifting to {tgt_ft:.2f}ft"
                         command_to_send = b"STOP\n"
-
-                    elif line_detected:
-                        missing_line_frames = 0
-                        throttle_speed = int(np.interp(cy, [0, LINE_ROI_H], [127, 40]))
-                        send_spd(throttle_speed)
-
-                        if active_cam_idx == FRONT_CAM_INDEX:
-                            if error < -100:
-                                status, command_to_send = "Edge LEFT", b"LEFT\n"
-                            elif error > 100:
-                                status, command_to_send = "Edge RIGHT", b"RIGHT\n"
-                            elif error < -50 or angle < -50:
-                                status, command_to_send = "Tight Arc L", b"TIGHT_ARC_LEFT\n"
-                            elif error > 50 or angle > 50:
-                                status, command_to_send = "Tight Arc R", b"TIGHT_ARC_RIGHT\n"
-                            elif error < -15 or angle < -15:
-                                status, command_to_send = "Arc LEFT", b"ARC_LEFT\n"
-                            elif error > 15 or angle > 15:
-                                status, command_to_send = "Arc RIGHT", b"ARC_RIGHT\n"
+                        if lidar_available and current_height_ft is not None:
+                            if current_height_ft < tgt_ft - height_tolerance_ft:
+                                _send_lift_command(LIFT_UP_COMMAND)
+                            elif current_height_ft > tgt_ft + height_tolerance_ft:
+                                _send_lift_command(LIFT_DOWN_COMMAND)
                             else:
-                                status, command_to_send = "FORWARD", b"FORWARD\n"
+                                _send_lift_command(LIFT_STOP_COMMAND)
+                                is_adjusting_height = False
+                                estimated_height_ft = tgt_ft
                         else:
-                            if error < -100:
-                                status, command_to_send = "Edge REV L", b"LEFT\n"
-                            elif error > 100:
-                                status, command_to_send = "Edge REV R", b"RIGHT\n"
-                            elif error < -50 or angle < -50:
-                                status, command_to_send = "Tight Arc L", b"TIGHT_ARC_REV_RIGHT\n"
-                            elif error > 50 or angle > 50:
-                                status, command_to_send = "Tight Arc R", b"TIGHT_ARC_REV_LEFT\n"
-                            elif error < -15 or angle < -15:
-                                status, command_to_send = "Arc REV L", b"ARC_REV_RIGHT\n"
-                            elif error > 15 or angle > 15:
-                                status, command_to_send = "Arc REV R", b"ARC_REV_LEFT\n"
+                            if estimated_height_ft is None:
+                                estimated_height_ft = lower_height_ft
+                            distance_ft = abs(tgt_ft - estimated_height_ft)
+                            if distance_ft <= height_tolerance_ft:
+                                _send_lift_command(LIFT_STOP_COMMAND)
+                                is_adjusting_height = False
+                                estimated_height_ft = tgt_ft
                             else:
-                                status, command_to_send = "BACKWARD", b"BACKWARD\n"
+                                speed_ft = max(LIFT_SPEED_FT_PER_SEC, 0.01)
+                                duration_sec = distance_ft / speed_ft
+                                duration_sec = max(LIFT_MOVE_MIN_SEC, min(LIFT_MOVE_MAX_SEC, duration_sec))
+                                direction_cmd = LIFT_UP_COMMAND if tgt_ft > estimated_height_ft else LIFT_DOWN_COMMAND
+                                _cancel_lift_timer()
+                                _write_ascii_command(direction_cmd)
+                                _schedule_lift_stop(duration_sec)
+                                estimated_height_ft = tgt_ft
+                                is_adjusting_height = False
+                                lift_status = f"Lifting to {tgt_ft:.2f}ft (timed)"
                     else:
-                        missing_line_frames += 1
-                        status = f"Searching... ({missing_line_frames}/{MISSING_LINE_THRESHOLD})"
-                        command_to_send = b"STOP\n"
+                        if not is_adjusting_height:
+                            _send_lift_command(LIFT_STOP_COMMAND)
 
-                        if missing_line_frames >= MISSING_LINE_THRESHOLD:
+                        if 0 < distance < SAFE_DISTANCE_MM:
+                            status = "STOP! OBSTACLE"
+                            command_to_send = b"STOP\n"
+
+                        elif line_detected:
                             missing_line_frames = 0
+                            throttle_speed = int(np.interp(cy, [0, LINE_ROI_H], [127, 40]))
+                            send_spd(throttle_speed)
 
-                            if current_nav_state == STATE_ROW_OUTWARD:
-                                if num_cams > 1:
-                                    current_nav_state = STATE_ROW_RETURN
-                                    active_cam_idx = REAR_CAM_INDEX
-                                    _begin_height_adjustment(upper_height_ft)
-                                    print("\n[SYSTEM] End of row. Reversing. Active feed: REAR CAM (RED TAPE)")
+                            if active_cam_idx == FRONT_CAM_INDEX:
+                                if error < -100:
+                                    status, command_to_send = "Edge LEFT", b"LEFT\n"
+                                elif error > 100:
+                                    status, command_to_send = "Edge RIGHT", b"RIGHT\n"
+                                elif error < -50 or angle < -50:
+                                    status, command_to_send = "Tight Arc L", b"TIGHT_ARC_LEFT\n"
+                                elif error > 50 or angle > 50:
+                                    status, command_to_send = "Tight Arc R", b"TIGHT_ARC_RIGHT\n"
+                                elif error < -15 or angle < -15:
+                                    status, command_to_send = "Arc LEFT", b"ARC_LEFT\n"
+                                elif error > 15 or angle > 15:
+                                    status, command_to_send = "Arc RIGHT", b"ARC_RIGHT\n"
                                 else:
-                                    status = "END OF TAPE. STOPPED."
-                            elif current_nav_state == STATE_ROW_RETURN:
-                                current_nav_state = STATE_AISLE_TRANSIT
-                                active_cam_idx = FRONT_CAM_INDEX
-                                _begin_height_adjustment(lower_height_ft)
-                                print("\n[SYSTEM] Row complete. Entering aisle. Active feed: FRONT CAM (GREEN TAPE)")
+                                    status, command_to_send = "FORWARD", b"FORWARD\n"
                             else:
-                                current_nav_state = STATE_ROW_OUTWARD
-                                active_cam_idx = FRONT_CAM_INDEX
-                                print("\n[SYSTEM] Arrived at new row. Active feed: FRONT CAM (RED TAPE)")
+                                if error < -100:
+                                    status, command_to_send = "Edge REV L", b"LEFT\n"
+                                elif error > 100:
+                                    status, command_to_send = "Edge REV R", b"RIGHT\n"
+                                elif error < -50 or angle < -50:
+                                    status, command_to_send = "Tight Arc L", b"TIGHT_ARC_REV_RIGHT\n"
+                                elif error > 50 or angle > 50:
+                                    status, command_to_send = "Tight Arc R", b"TIGHT_ARC_REV_LEFT\n"
+                                elif error < -15 or angle < -15:
+                                    status, command_to_send = "Arc REV L", b"ARC_REV_RIGHT\n"
+                                elif error > 15 or angle > 15:
+                                    status, command_to_send = "Arc REV R", b"ARC_REV_LEFT\n"
+                                else:
+                                    status, command_to_send = "BACKWARD", b"BACKWARD\n"
+                        else:
+                            missing_line_frames += 1
+                            status = f"Searching... ({missing_line_frames}/{MISSING_LINE_THRESHOLD})"
+                            command_to_send = b"STOP\n"
 
-                            time.sleep(0.5)
+                            if missing_line_frames >= MISSING_LINE_THRESHOLD:
+                                missing_line_frames = 0
+
+                                if current_nav_state == STATE_ROW_OUTWARD:
+                                    if num_cams > 1:
+                                        current_nav_state = STATE_ROW_RETURN
+                                        active_cam_idx = REAR_CAM_INDEX
+                                        _begin_height_adjustment(upper_height_ft)
+                                        print("\n[SYSTEM] End of row. Reversing. Active feed: REAR CAM (RED TAPE)")
+                                    else:
+                                        status = "END OF TAPE. STOPPED."
+                                elif current_nav_state == STATE_ROW_RETURN:
+                                    current_nav_state = STATE_AISLE_TRANSIT
+                                    active_cam_idx = FRONT_CAM_INDEX
+                                    _begin_height_adjustment(lower_height_ft)
+                                    print("\n[SYSTEM] Row complete. Entering aisle. Active feed: FRONT CAM (GREEN TAPE)")
+                                else:
+                                    current_nav_state = STATE_ROW_OUTWARD
+                                    active_cam_idx = FRONT_CAM_INDEX
+                                    print("\n[SYSTEM] Arrived at new row. Active feed: FRONT CAM (RED TAPE)")
+
+                                time.sleep(0.5)
 
                     send_drive_command(command_to_send)
 
@@ -2242,9 +2242,9 @@ def run_obstacle_detection(
 
                     if frame_hub is not None:
                         frame_hub.update(camera_labels[i], rgb_frame)
-            else:
-                if rgb_frame is not None and frame_hub is not None:
-                    frame_hub.update(camera_labels[i], rgb_frame)
+                else:
+                    if rgb_frame is not None and frame_hub is not None:
+                        frame_hub.update(camera_labels[i], rgb_frame)
 
     _cancel_lift_timer()
     if GUI_AVAILABLE:
