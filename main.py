@@ -74,6 +74,9 @@ def _env_flag(name: str, default: str = "0") -> bool:
 DRIVE_DEBUG_LOGS = _env_flag("DRIVE_DEBUG_LOGS", "1")
 DRIVE_HEARTBEAT_INTERVAL_SEC = _read_float_env("DRIVE_HEARTBEAT_INTERVAL_SEC", 0.2)
 
+DEFAULT_LOWER_OBSTACLE_HEIGHT_FT = _read_float_env("OBSTACLE_LOWER_HEIGHT_FT", 1.5)
+DEFAULT_UPPER_OBSTACLE_HEIGHT_FT = _read_float_env("OBSTACLE_UPPER_HEIGHT_FT", 3.5)
+
 
 def utc_now_iso(timespec: str = "seconds") -> str:
     """Return an ISO 8601 UTC timestamp with a 'Z' suffix."""
@@ -197,6 +200,40 @@ class SerialController:
             "worker_alive": worker_alive,
         }
 
+    def in_waiting(self) -> int:
+        """Expose pending byte count for shared serial consumers."""
+        with self._serial_lock:
+            self._open_serial()
+            if self._serial is None or not self._serial.is_open:
+                return 0
+            try:
+                return int(getattr(self._serial, "in_waiting", 0))
+            except (SerialException, OSError, ValueError):
+                return 0
+
+    def readline(self, timeout_sec: float | None = 0.0) -> bytes:
+        """Read a single line from the serial port without blocking the drive worker."""
+        with self._serial_lock:
+            self._open_serial()
+            if self._serial is None or not self._serial.is_open:
+                return b""
+            previous_timeout = getattr(self._serial, "timeout", None)
+            if timeout_sec is not None:
+                try:
+                    self._serial.timeout = max(timeout_sec, 0.0)
+                except (ValueError, AttributeError):
+                    pass
+            try:
+                return self._serial.readline()
+            except (SerialException, OSError):
+                return b""
+            finally:
+                if timeout_sec is not None and self._serial is not None:
+                    try:
+                        self._serial.timeout = previous_timeout
+                    except Exception:
+                        pass
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -306,6 +343,17 @@ class SerialWriterAdapter:
         if command:
             self._controller.send(command)
 
+    @property
+    def in_waiting(self) -> int:
+        if not self._controller:
+            return 0
+        return self._controller.in_waiting()
+
+    def readline(self, timeout_sec: float | None = 0.0) -> bytes:
+        if not self._controller:
+            return b""
+        return self._controller.readline(timeout_sec)
+
     def close(self) -> None:  # pragma: no cover - noop shim
         return
 
@@ -361,6 +409,60 @@ class ModeState:
             return True
 
 
+class ObstacleHeightState:
+    """Mutable store for requested lower/upper actuator targets."""
+
+    _MIN_DELTA = 0.05
+
+    def __init__(self, lower_ft: float, upper_ft: float) -> None:
+        self._lock = threading.Lock()
+        safe_lower = max(lower_ft, 0.1)
+        safe_upper = max(upper_ft, safe_lower + self._MIN_DELTA)
+        self._lower = safe_lower
+        self._upper = safe_upper
+        self._version = 0
+        self._updated_at = utc_now_iso("seconds")
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "lower_height": self._lower,
+                "upper_height": self._upper,
+                "updated_at": self._updated_at,
+                "version": self._version,
+            }
+
+    def get_range(self) -> tuple[float, float, int]:
+        with self._lock:
+            return self._lower, self._upper, self._version
+
+    def set_heights(self, lower: float | None, upper: float | None) -> dict[str, Any]:
+        if lower is None and upper is None:
+            raise ValueError("At least one of lower or upper height must be provided.")
+
+        with self._lock:
+            new_lower = self._lower if lower is None else lower
+            new_upper = self._upper if upper is None else upper
+            if new_lower <= 0 or new_upper <= 0:
+                raise ValueError("Heights must be greater than zero.")
+            if new_upper - new_lower < self._MIN_DELTA:
+                raise ValueError("Upper height must be greater than lower height.")
+
+            changed = (new_lower != self._lower) or (new_upper != self._upper)
+            if changed:
+                self._lower = new_lower
+                self._upper = new_upper
+                self._version += 1
+                self._updated_at = utc_now_iso("seconds")
+
+            return {
+                "lower_height": self._lower,
+                "upper_height": self._upper,
+                "updated_at": self._updated_at,
+                "version": self._version,
+                "updated": changed,
+            }
+
 @dataclass(slots=True)
 class CommandDispatchResult:
     status_code: int
@@ -389,11 +491,13 @@ class ControlCommandDispatcher:
         mode_state: ModeState,
         joystick_deadzone: float = JOYSTICK_DEADZONE,
         drive_heartbeat: DriveHeartbeat | None = None,
+        obstacle_height_state: ObstacleHeightState | None = None,
     ) -> None:
         self._serial = serial_controller
         self._mode = mode_state
         self._deadzone = joystick_deadzone
         self._drive_heartbeat = drive_heartbeat
+        self._obstacle_heights = obstacle_height_state
         self._ws_handlers: dict[str, Callable[[dict[str, Any]], CommandDispatchResult]] = {
             "drive": self._ws_drive,
             "lift": self._ws_lift,
@@ -458,6 +562,35 @@ class ControlCommandDispatcher:
             return self._error_result("Fan command must be 'on' or 'off'.")
         command = FAN_ON_COMMAND if normalized == "ON" else FAN_OFF_COMMAND
         return self._send_simple(command, topic="fan", verb=normalized)
+
+    def get_obstacle_heights(self) -> CommandDispatchResult:
+        if not self._obstacle_heights:
+            return self._error_result("Obstacle height subsystem not configured.", status_code=503)
+        snapshot = self._obstacle_heights.snapshot()
+        return CommandDispatchResult(200, snapshot)
+
+    def set_obstacle_heights(self, lower: Any, upper: Any) -> CommandDispatchResult:
+        if not self._obstacle_heights:
+            return self._error_result("Obstacle height subsystem not configured.", status_code=503)
+
+        provided_lower = lower is not None
+        provided_upper = upper is not None
+        if not provided_lower and not provided_upper:
+            return self._error_result("Provide at least 'lower' or 'upper' height in feet.")
+
+        lower_value = self._coerce_positive_height(lower) if provided_lower else None
+        upper_value = self._coerce_positive_height(upper) if provided_upper else None
+
+        if provided_lower and lower_value is None:
+            return self._error_result("Lower height must be a positive number.")
+        if provided_upper and upper_value is None:
+            return self._error_result("Upper height must be a positive number.")
+
+        try:
+            result = self._obstacle_heights.set_heights(lower_value, upper_value)
+        except ValueError as exc:
+            return self._error_result(str(exc))
+        return CommandDispatchResult(200, result)
 
     def get_mode_response(self) -> CommandDispatchResult:
         return CommandDispatchResult(200, {"mode": self._mode.get_mode()})
@@ -564,6 +697,12 @@ class ControlCommandDispatcher:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    def _coerce_positive_height(self, value: Any) -> float | None:
+        parsed = self._coerce_float(value)
+        if parsed is None or parsed <= 0:
+            return None
+        return parsed
 
     def _error_result(self, message: str, status_code: int = 400) -> CommandDispatchResult:
         return CommandDispatchResult(status_code, {"error": message})
@@ -715,11 +854,17 @@ def create_app(
     frame_hub: FrameHub,
     mode_state: ModeState,
     db: DetectionDatabase,
+    obstacle_height_state: ObstacleHeightState | None = None,
     drive_heartbeat: DriveHeartbeat | None = None,
 ) -> Flask:
     app = Flask(__name__)
     sock = Sock(app)
-    dispatcher = ControlCommandDispatcher(serial_controller, mode_state, drive_heartbeat=drive_heartbeat)
+    dispatcher = ControlCommandDispatcher(
+        serial_controller,
+        mode_state,
+        drive_heartbeat=drive_heartbeat,
+        obstacle_height_state=obstacle_height_state,
+    )
 
     def _json_response(result: CommandDispatchResult):
         return jsonify(result.payload), result.status_code
@@ -805,6 +950,17 @@ def create_app(
         data = request.get_json(silent=True) or {}
         requested_mode = data.get("mode")
         return _json_response(dispatcher.set_mode_response(requested_mode))
+
+    @app.get("/api/obstacle/heights")
+    def api_get_obstacle_heights():
+        return _json_response(dispatcher.get_obstacle_heights())
+
+    @app.post("/api/obstacle/heights")
+    def api_set_obstacle_heights():
+        data = request.get_json(silent=True) or {}
+        lower = data.get("lower", data.get("lower_height"))
+        upper = data.get("upper", data.get("upper_height"))
+        return _json_response(dispatcher.set_obstacle_heights(lower, upper))
 
     @app.route("/video")
     def video():
@@ -1586,6 +1742,7 @@ def run_obstacle_detection(
     device_infos_override: list[dai.DeviceInfo] | None = None,
     mode_state: ModeState | None = None,
     frame_hub: FrameHub | None = None,
+    height_state: ObstacleHeightState | None = None,
 ) -> None:
     """Run the provided obstacle detection loop alongside pest-identification cameras and publish frames."""
     # Hardware Communication Protocols
@@ -1606,16 +1763,67 @@ def run_obstacle_detection(
     should_quit = False
 
     # System Parameters & Constraints
-    SAFE_DISTANCE_MM = 300
+    SAFE_DISTANCE_MM = 600
     MIN_CONTOUR_AREA = 500
-    MISSING_LINE_THRESHOLD = 15  # Frame threshold to trigger camera failover
+    MISSING_LINE_THRESHOLD = 30  # Frame threshold to trigger navigation transition
 
-    OBST_ROI_W, OBST_ROI_H = 100, 100
+    OBST_ROI_W, OBST_ROI_H = 200, 100
     OBST_ROI_X = (640 - OBST_ROI_W) // 2
-    OBST_ROI_Y = (380 - OBST_ROI_H) // 2
+    OBST_ROI_Y = 0
 
     LINE_ROI_W, LINE_ROI_H = 200, 200
     LINE_ROI_X, LINE_ROI_Y = (640 - LINE_ROI_W) // 2, 280
+
+    # --- FINITE STATE MACHINE VARIABLES ---
+    STATE_ROW_OUTWARD = 0
+    STATE_ROW_RETURN = 1
+    STATE_AISLE_TRANSIT = 2
+
+    current_nav_state = STATE_ROW_OUTWARD
+
+    if height_state is not None:
+        lower_height, higher_height, height_version = height_state.get_range()
+    else:
+        lower_height = DEFAULT_LOWER_OBSTACLE_HEIGHT_FT
+        higher_height = DEFAULT_UPPER_OBSTACLE_HEIGHT_FT
+        height_version = 0
+
+    current_height = 0.0
+    target_height = lower_height
+    height_tolerance = 0.1
+    is_adjusting_height = False
+    last_auto_cmd = b""
+    last_auto_cmd_time = 0.0
+
+    height_feedback_available = bool(esp32) and hasattr(esp32, "readline")
+
+    def _target_for_state(state: int) -> float:
+        return higher_height if state == STATE_ROW_RETURN else lower_height
+
+    def _set_target_height(desired: float, auto_adjust: bool = True) -> None:
+        nonlocal target_height, is_adjusting_height
+        target_height = desired
+        if not esp32 or not height_feedback_available:
+            return
+        if auto_adjust and abs(current_height - target_height) > height_tolerance:
+            is_adjusting_height = True
+
+    def _sync_height_targets(force: bool = False) -> None:
+        nonlocal lower_height, higher_height, height_version
+        if height_state is None:
+            return
+        latest_lower, latest_upper, latest_version = height_state.get_range()
+        if not force and latest_version == height_version:
+            return
+        lower_height = latest_lower
+        higher_height = latest_upper
+        height_version = latest_version
+        _set_target_height(_target_for_state(current_nav_state), auto_adjust=True)
+
+    if height_state is not None:
+        _sync_height_targets(force=True)
+    else:
+        _set_target_height(lower_height, auto_adjust=True)
 
     # DepthAI Multi-Device Configuration
     device_infos = device_infos_override if device_infos_override is not None else dai.Device.getAllAvailableDevices()
@@ -1634,6 +1842,7 @@ def run_obstacle_detection(
 
     active_cam_idx = 1 if num_cams > 1 else 0
     missing_line_frames = 0
+    last_drive_command: bytes | None = None
 
     # Context manager for safe multi-device USB allocation
     with ExitStack() as stack:
@@ -1692,19 +1901,43 @@ def run_obstacle_detection(
         print("\nSystem active. Awaiting user interrupt (q).")
         last_frame_time = time.time()
 
-        last_command_sent: bytes | None = None
-
         while not should_quit:
             is_autonomous = mode_state.is_autonomous() if mode_state is not None else True
-            if not is_autonomous and esp32 and last_command_sent != b"STOP\n":
+            if not is_autonomous and esp32 and last_drive_command != b"STOP\n":
                 esp32.write(b"STOP\n")
-                last_command_sent = b"STOP\n"
+                last_drive_command = b"STOP\n"
 
             current_time = time.time()
             if current_time - last_frame_time < (1.0 / FPS_LIMIT):
                 time.sleep(0.001)
                 continue
             last_frame_time = current_time
+
+            _sync_height_targets()
+
+            # 1. READ LIDAR DATA (Non-blocking)
+            if esp32 and height_feedback_available:
+                reads = 0
+                while True:
+                    try:
+                        waiting = esp32.in_waiting
+                    except Exception:
+                        break
+                    if waiting <= 0 or reads > 10:
+                        break
+                    try:
+                        line = esp32.readline().decode("utf-8", errors="ignore").strip()
+                    except Exception:
+                        break
+                    reads += 1
+                    if not line:
+                        continue
+                    if "LIDAR Distance:" in line:
+                        try:
+                            raw_lidar_feet = float(line.split(":", 1)[1].strip())
+                            current_height = raw_lidar_feet + 1.5  # 1.5ft offset
+                        except (ValueError, IndexError):
+                            continue
 
             # Clear buffer queues across all devices to prevent USB overflow
             for i in range(num_cams):
@@ -1741,19 +1974,28 @@ def run_obstacle_detection(
 
                     # Vision Processing & Trajectory Calculation
                     line_roi_slice = rgb_frame[LINE_ROI_Y : LINE_ROI_Y + LINE_ROI_H, LINE_ROI_X : LINE_ROI_X + LINE_ROI_W]
+                    blurred_roi = cv2.GaussianBlur(line_roi_slice, (9, 9), 0)
+                    hsv_roi = cv2.cvtColor(blurred_roi, cv2.COLOR_BGR2HSV)
 
-                    # Apply HSV transformation and aggregate red hue boundaries
-                    hsv_roi = cv2.cvtColor(line_roi_slice, cv2.COLOR_BGR2HSV)
+                    if current_nav_state in (STATE_ROW_OUTWARD, STATE_ROW_RETURN):
+                        lower_color_1 = np.array([0, 60, 60])
+                        upper_color_1 = np.array([10, 255, 255])
+                        mask1 = cv2.inRange(hsv_roi, lower_color_1, upper_color_1)
 
-                    lower_red_1 = np.array([0, 100, 100])
-                    upper_red_1 = np.array([10, 255, 255])
-                    mask1 = cv2.inRange(hsv_roi, lower_red_1, upper_red_1)
+                        lower_color_2 = np.array([160, 60, 60])
+                        upper_color_2 = np.array([180, 255, 255])
+                        mask2 = cv2.inRange(hsv_roi, lower_color_2, upper_color_2)
+                        thresh = cv2.bitwise_or(mask1, mask2)
+                        target_color_text = "Target: RED"
+                    else:
+                        lower_green = np.array([40, 60, 60])
+                        upper_green = np.array([90, 255, 255])
+                        thresh = cv2.inRange(hsv_roi, lower_green, upper_green)
+                        target_color_text = "Target: GREEN"
 
-                    lower_red_2 = np.array([160, 100, 100])
-                    upper_red_2 = np.array([180, 255, 255])
-                    mask2 = cv2.inRange(hsv_roi, lower_red_2, upper_red_2)
-
-                    thresh = cv2.bitwise_or(mask1, mask2)
+                    kernel = np.ones((5, 5), np.uint8)
+                    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+                    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
                     # Diagnostic output window
                     cv2.imshow("Binary Mask", thresh)
@@ -1762,6 +2004,8 @@ def run_obstacle_detection(
 
                     line_detected = False
                     error = 0
+                    angle = 0
+                    cy = LINE_ROI_H // 2
                     box_center_x = LINE_ROI_W // 2
 
                     cv2.rectangle(
@@ -1777,42 +2021,104 @@ def run_obstacle_detection(
                         if cv2.contourArea(c) > MIN_CONTOUR_AREA:
                             M = cv2.moments(c)
                             if M["m00"] != 0:
-                                error = int(M["m10"] / M["m00"]) - box_center_x
+                                cx = int(M["m10"] / M["m00"])
+                                cy = int(M["m01"] / M["m00"])
+                                error = cx - box_center_x
+
+                                topmost = tuple(c[c[:, :, 1].argmin()][0])
+                                bottommost = tuple(c[c[:, :, 1].argmax()][0])
+                                dx = topmost[0] - bottommost[0]
+                                dy = bottommost[1] - topmost[1]
+                                if dy == 0:
+                                    dy = 1
+                                angle = int(np.degrees(np.arctan2(dx, dy)))
                                 line_detected = True
                                 cv2.circle(
                                     rgb_frame,
-                                    (int(M["m10"] / M["m00"]) + LINE_ROI_X, int(M["m01"] / M["m00"]) + LINE_ROI_Y),
+                                    (cx + LINE_ROI_X, cy + LINE_ROI_Y),
                                     5,
                                     (0, 0, 255),
                                     -1,
                                 )
+                                cv2.line(
+                                    rgb_frame,
+                                    (bottommost[0] + LINE_ROI_X, bottommost[1] + LINE_ROI_Y),
+                                    (topmost[0] + LINE_ROI_X, topmost[1] + LINE_ROI_Y),
+                                    (0, 255, 0),
+                                    3,
+                                )
 
                     # State Machine & Actuation Logic
-                    command_to_send = b"STOP\n"
+                    command_to_send = b""
                     status = ""
 
                     # Hardware index mapping
                     FRONT_CAM_INDEX = 1 if num_cams > 1 else 0
                     REAR_CAM_INDEX = 0
 
-                    if 0 < distance < SAFE_DISTANCE_MM:
+                    if is_adjusting_height and esp32 and height_feedback_available:
+                        status = f"Lifting to {target_height:.1f}ft..."
+                        candidate_cmd = b""
+                        if current_height < target_height - height_tolerance:
+                            candidate_cmd = b"UP\n"
+                        elif current_height > target_height + height_tolerance:
+                            candidate_cmd = b"DOWN\n"
+                        else:
+                            print(f"\n[SYSTEM] Height {target_height:.1f}ft reached. Resuming driving.")
+                            command_to_send = b"STOP\n"
+                            is_adjusting_height = False
+                            last_auto_cmd = b""
+                            missing_line_frames = 0
+
+                        if candidate_cmd and command_to_send == b"":
+                            if last_auto_cmd != candidate_cmd or (current_time - last_auto_cmd_time > 0.2):
+                                command_to_send = candidate_cmd
+                                last_auto_cmd = candidate_cmd
+                                last_auto_cmd_time = current_time
+
+                    elif is_adjusting_height and not height_feedback_available:
+                        status = "Height adjust unavailable (no feedback)"
+                        is_adjusting_height = False
+
+                    elif 0 < distance < SAFE_DISTANCE_MM:
                         status = "STOP! OBSTACLE"
                         command_to_send = b"STOP\n"
 
                     elif line_detected:
                         missing_line_frames = 0
+
+                        throttle_speed = int(np.interp(cy, [0, LINE_ROI_H], [127, 40]))
+                        if esp32 and is_autonomous and not is_adjusting_height:
+                            esp32.write(f"SPD:{throttle_speed}\n".encode())
+
                         if active_cam_idx == FRONT_CAM_INDEX:
-                            if error < -15:
-                                status, command_to_send = "Turn LEFT", b"LEFT\n"
-                            elif error > 15:
-                                status, command_to_send = "Turn RIGHT", b"RIGHT\n"
+                            if error < -100:
+                                status, command_to_send = "Edge LEFT", b"LEFT\n"
+                            elif error > 100:
+                                status, command_to_send = "Edge RIGHT", b"RIGHT\n"
+                            elif error < -50 or angle < -50:
+                                status, command_to_send = "Tight Arc L", b"TIGHT_ARC_LEFT\n"
+                            elif error > 50 or angle > 50:
+                                status, command_to_send = "Tight Arc R", b"TIGHT_ARC_RIGHT\n"
+                            elif error < -15 or angle < -15:
+                                status, command_to_send = "Arc LEFT", b"ARC_LEFT\n"
+                            elif error > 15 or angle > 15:
+                                status, command_to_send = "Arc RIGHT", b"ARC_RIGHT\n"
                             else:
                                 status, command_to_send = "FORWARD", b"FORWARD\n"
                         elif active_cam_idx == REAR_CAM_INDEX:
-                            if error < -15:
-                                status, command_to_send = "Reverse LEFT", b"LEFT\n"
-                            elif error > 15:
-                                status, command_to_send = "Reverse RIGHT", b"RIGHT\n"
+                            if error < -100:
+                                status, command_to_send = "Edge REV L", b"LEFT\n"
+                            elif error > 100:
+                                status, command_to_send = "Edge REV R", b"RIGHT\n"
+                            elif error < -50 or angle < -50:
+                                status, command_to_send = "Tight Arc L", b"TIGHT_ARC_REV_RIGHT\n"
+                            elif error > 50 or angle > 50:
+                                status, command_to_send = "Tight Arc R", b"TIGHT_ARC_REV_LEFT\n"
+                            elif error < -15 or angle < -15:
+                                status, command_to_send = "Arc REV L", b"ARC_REV_RIGHT\n"
+                            elif error > 15 or angle > 15:
+                                status, command_to_send = "Arc REV R", b"ARC_REV_LEFT\n"
                             else:
                                 status, command_to_send = "BACKWARD", b"BACKWARD\n"
 
@@ -1823,22 +2129,44 @@ def run_obstacle_detection(
                         command_to_send = b"STOP\n"
 
                         if missing_line_frames >= MISSING_LINE_THRESHOLD:
-                            if num_cams > 1:
-                                active_cam_idx = REAR_CAM_INDEX if active_cam_idx == FRONT_CAM_INDEX else FRONT_CAM_INDEX
-                                missing_line_frames = 0
-                                print(f"\n[SYSTEM] Executing failover. Active feed: Camera {active_cam_idx}")
-                                time.sleep(0.5)
-                            else:
-                                status = "END OF TAPE. STOPPED."
+                            missing_line_frames = 0
+                            if current_nav_state == STATE_ROW_OUTWARD:
+                                if num_cams > 1:
+                                    current_nav_state = STATE_ROW_RETURN
+                                    active_cam_idx = REAR_CAM_INDEX
+                                    _set_target_height(higher_height, auto_adjust=True)
+                                    print("\n[SYSTEM] End of row. Adjusting to HIGHER height. Active feed: REAR CAM (RED TAPE)")
+                                else:
+                                    status = "END OF TAPE. STOPPED."
+                            elif current_nav_state == STATE_ROW_RETURN:
+                                current_nav_state = STATE_AISLE_TRANSIT
+                                active_cam_idx = FRONT_CAM_INDEX
+                                _set_target_height(lower_height, auto_adjust=True)
+                                print("\n[SYSTEM] Row complete. Adjusting to LOWER height. Entering aisle. Active feed: FRONT CAM (GREEN TAPE)")
+                            elif current_nav_state == STATE_AISLE_TRANSIT:
+                                current_nav_state = STATE_ROW_OUTWARD
+                                active_cam_idx = FRONT_CAM_INDEX
+                                _set_target_height(lower_height, auto_adjust=True)
+                                print("\n[SYSTEM] Arrived at new row. Active feed: FRONT CAM (RED TAPE)")
+                            time.sleep(0.5)
 
-                    if esp32 and is_autonomous:
-                        if command_to_send != last_command_sent:
-                            esp32.write(command_to_send)
-                            last_command_sent = command_to_send
+                    if esp32 and is_autonomous and command_to_send:
+                        esp32.write(command_to_send)
+                        last_drive_command = command_to_send
 
                     # Render active camera telemetry
                     cam_label = camera_labels[active_cam_idx].replace("_", " ").upper()
                     cv2.putText(rgb_frame, cam_label, (450, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
+                    cv2.putText(rgb_frame, target_color_text, (450, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                    cv2.putText(
+                        rgb_frame,
+                        f"Height: {current_height:.1f}ft / Target: {target_height:.1f}ft",
+                        (300, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 0),
+                        2,
+                    )
                     cv2.putText(rgb_frame, status, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
 
                     cv2.imshow("Robot View", rgb_frame)
@@ -1871,9 +2199,20 @@ SERIAL_CONTROLLER = SerialController(
 )
 FRAME_HUB = FrameHub()
 MODE_STATE = ModeState()
+OBSTACLE_HEIGHTS = ObstacleHeightState(
+    DEFAULT_LOWER_OBSTACLE_HEIGHT_FT,
+    DEFAULT_UPPER_OBSTACLE_HEIGHT_FT,
+)
 DETECTION_DB = DetectionDatabase(DB_PATH)
 DRIVE_HEARTBEAT = DriveHeartbeat(SERIAL_CONTROLLER, DRIVE_HEARTBEAT_INTERVAL_SEC)
-app = create_app(SERIAL_CONTROLLER, FRAME_HUB, MODE_STATE, DETECTION_DB, DRIVE_HEARTBEAT)
+app = create_app(
+    SERIAL_CONTROLLER,
+    FRAME_HUB,
+    MODE_STATE,
+    DETECTION_DB,
+    OBSTACLE_HEIGHTS,
+    DRIVE_HEARTBEAT,
+)
 
 
 def main() -> None:
@@ -1900,7 +2239,7 @@ def main() -> None:
             print("[INFO] Obstacle cameras active in passive mode until autonomous mode is enabled.")
         obstacle_thread = threading.Thread(
             target=run_obstacle_detection,
-            args=(SERIAL_CONTROLLER, obstacle_devices, MODE_STATE, FRAME_HUB),
+            args=(SERIAL_CONTROLLER, obstacle_devices, MODE_STATE, FRAME_HUB, OBSTACLE_HEIGHTS),
             daemon=True,
         )
         obstacle_thread.start()
