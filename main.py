@@ -89,6 +89,10 @@ LIFT_STOP_COMMAND = os.environ.get("LIFT_STOP_COMMAND", "STOP")
 
 SerialResult = tuple[bool, str]
 
+LIFT_SPEED_MM_PER_SEC = _read_float_env("LIFT_SPEED_MM_PER_SEC", 25.0)
+LIFT_MOVE_MIN_SEC = _read_float_env("LIFT_MOVE_MIN_SEC", 0.4)
+LIFT_MOVE_MAX_SEC = _read_float_env("LIFT_MOVE_MAX_SEC", 4.0)
+
 
 @dataclass(slots=True)
 class SerialJob:
