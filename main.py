@@ -80,6 +80,7 @@ def utc_now_iso(timespec: str = "seconds") -> str:
     return datetime.now(timezone.utc).isoformat(timespec=timespec).replace("+00:00", "Z")
 
 # Default actuator commands (override via env vars if firmware differs)
+GUI_AVAILABLE = bool(os.environ.get("DISPLAY")) and os.environ.get("QT_QPA_PLATFORM", "").lower() != "offscreen"
 FAN_ON_COMMAND = os.environ.get("FAN_ON_COMMAND", "FAN")
 FAN_OFF_COMMAND = os.environ.get("FAN_OFF_COMMAND", "STOP")
 LIFT_UP_COMMAND = os.environ.get("LIFT_UP_COMMAND", "UP")
@@ -2005,7 +2006,8 @@ def run_obstacle_detection(
                     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
                     thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
-                    cv2.imshow("Binary Mask", thresh)
+                    if GUI_AVAILABLE:
+                        cv2.imshow("Binary Mask", thresh)
                     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
                     line_detected = False
@@ -2179,9 +2181,10 @@ def run_obstacle_detection(
                     else:
                         cv2.putText(rgb_frame, height_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
-                    cv2.imshow("Robot View", rgb_frame)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        should_quit = True
+                    if GUI_AVAILABLE:
+                        cv2.imshow("Robot View", rgb_frame)
+                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                            should_quit = True
 
                     if frame_hub is not None:
                         frame_hub.update(camera_labels[i], rgb_frame)
@@ -2189,7 +2192,8 @@ def run_obstacle_detection(
                     frame_hub.update(camera_labels[i], rgb_frame)
 
     _cancel_lift_timer()
-    cv2.destroyAllWindows()
+    if GUI_AVAILABLE:
+        cv2.destroyAllWindows()
     if esp32:
         print("\nInitiating safe shutdown sequence...")
         try:
