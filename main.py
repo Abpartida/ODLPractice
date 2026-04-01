@@ -1991,6 +1991,29 @@ def run_obstacle_detection(
                 rgb_frame = in_rgb.getCvFrame() if in_rgb is not None else None
 
                 if i == active_cam_idx and rgb_frame is not None:
+                    target_color_text = (
+                        "Target: RED" if current_nav_state in (STATE_ROW_OUTWARD, STATE_ROW_RETURN) else "Target: GREEN"
+                    )
+                    if not nav_enabled:
+                        status = nav_wait_reason or "Obstacle loop idle"
+                        heights_tuple = height_state.get_heights() if height_state else None
+                        if heights_tuple:
+                            height_text = f"Heights: {heights_tuple[0]:.1f}-{heights_tuple[1]:.1f}ft"
+                        else:
+                            height_text = "Heights: --"
+                        cam_label = "FRONT CAM" if active_cam_idx == FRONT_CAM_INDEX else "REAR CAM"
+                        cv2.putText(rgb_frame, cam_label, (450, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
+                        cv2.putText(rgb_frame, target_color_text, (450, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                        cv2.putText(rgb_frame, status, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
+                        cv2.putText(rgb_frame, height_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                        if GUI_AVAILABLE:
+                            cv2.imshow("Robot View", rgb_frame)
+                            if cv2.waitKey(1) & 0xFF == ord("q"):
+                                should_quit = True
+                        if frame_hub is not None:
+                            frame_hub.update(camera_labels[i], rgb_frame)
+                        continue
+
                     depth_frame = in_depth.getFrame() if in_depth is not None else None
 
                     distance = last_distance_mm
@@ -2086,26 +2109,6 @@ def run_obstacle_detection(
                                     (0, 255, 0),
                                     3,
                                 )
-
-                    if not nav_enabled:
-                        status = nav_wait_reason or "Obstacle loop idle"
-                        heights_tuple = height_state.get_heights() if height_state else None
-                        if heights_tuple:
-                            height_text = f"Heights: {heights_tuple[0]:.1f}-{heights_tuple[1]:.1f}ft"
-                        else:
-                            height_text = "Heights: --"
-                        cam_label = "FRONT CAM" if active_cam_idx == FRONT_CAM_INDEX else "REAR CAM"
-                        cv2.putText(rgb_frame, cam_label, (450, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
-                        cv2.putText(rgb_frame, target_color_text, (450, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                        cv2.putText(rgb_frame, status, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
-                        cv2.putText(rgb_frame, height_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                        if GUI_AVAILABLE:
-                            cv2.imshow("Robot View", rgb_frame)
-                            if cv2.waitKey(1) & 0xFF == ord("q"):
-                                should_quit = True
-                    if frame_hub is not None:
-                        frame_hub.update(camera_labels[i], rgb_frame)
-                    continue
 
                     nav_enabled_prev = nav_enabled
 
