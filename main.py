@@ -267,6 +267,15 @@ class SerialController:
             self._serial = None
             print(f"[ERROR] Failed to open serial {self.port}: {exc}")
 
+    def _reset_serial_input_unlocked(self) -> None:
+        serial_obj = self._serial
+        if not serial_obj or not serial_obj.is_open:
+            return
+        try:
+            serial_obj.reset_input_buffer()
+        except Exception:
+            pass
+
     def reset_input_buffer(self) -> None:
         """Public hook so other components can flush stale serial data."""
         with self._serial_lock:
