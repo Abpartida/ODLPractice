@@ -323,24 +323,24 @@ class ObstacleHeightState:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._lower_mm: float | None = None
-        self._upper_mm: float | None = None
+        self._lower_ft: float | None = None
+        self._upper_ft: float | None = None
 
-    def set_heights(self, lower_mm: float, upper_mm: float) -> None:
+    def set_heights(self, lower_ft: float, upper_ft: float) -> None:
         with self._lock:
-            self._lower_mm = lower_mm
-            self._upper_mm = upper_mm
+            self._lower_ft = lower_ft
+            self._upper_ft = upper_ft
 
     def clear(self) -> None:
         with self._lock:
-            self._lower_mm = None
-            self._upper_mm = None
+            self._lower_ft = None
+            self._upper_ft = None
 
     def get_heights(self) -> tuple[float, float] | None:
         with self._lock:
-            if self._lower_mm is None or self._upper_mm is None:
+            if self._lower_ft is None or self._upper_ft is None:
                 return None
-            return self._lower_mm, self._upper_mm
+            return self._lower_ft, self._upper_ft
 
     def has_heights(self) -> bool:
         return self.get_heights() is not None
@@ -537,26 +537,26 @@ class ControlCommandDispatcher:
         heights = self._height_state.get_heights()
         payload: dict[str, Any] = {"heights_set": bool(heights)}
         if heights:
-            payload["lower_mm"], payload["upper_mm"] = heights
+            payload["lower_ft"], payload["upper_ft"] = heights
         return CommandDispatchResult(200, payload)
 
     def set_obstacle_heights(self, lower: Any, upper: Any) -> CommandDispatchResult:
         if not self._height_state:
             return self._error_result("Obstacle height tracking unavailable.", status_code=503)
-        lower_val = self._coerce_float(lower)
-        upper_val = self._coerce_float(upper)
-        if lower_val is None or upper_val is None:
+        lower_ft = self._coerce_float(lower)
+        upper_ft = self._coerce_float(upper)
+        if lower_ft is None or upper_ft is None:
             return self._error_result("Both lower and upper heights must be numeric.")
-        if lower_val <= 0 or upper_val <= 0:
+        if lower_ft <= 0 or upper_ft <= 0:
             return self._error_result("Heights must be positive values.")
-        if lower_val >= upper_val:
+        if lower_ft >= upper_ft:
             return self._error_result("Upper height must be greater than lower height.")
-        self._height_state.set_heights(lower_val, upper_val)
+        self._height_state.set_heights(lower_ft, upper_ft)
         return CommandDispatchResult(
             200,
             {
-                "lower_mm": lower_val,
-                "upper_mm": upper_val,
+                "lower_ft": lower_ft,
+                "upper_ft": upper_ft,
                 "heights_set": True,
             },
         )
@@ -1844,10 +1844,9 @@ def run_obstacle_detection(
 
     def _update_height_targets_from_state() -> None:
         nonlocal lower_height_ft, upper_height_ft, last_height_pair_ft, estimated_height_ft, target_height_ft, is_adjusting_height
-        heights_mm = height_state.get_heights() if height_state else None
-        if heights_mm:
-            lower_ft = heights_mm[0] / 304.8
-            upper_ft = heights_mm[1] / 304.8
+        heights_ft = height_state.get_heights() if height_state else None
+        if heights_ft:
+            lower_ft, upper_ft = heights_ft
         else:
             lower_ft = DEFAULT_LOWER_FT
             upper_ft = DEFAULT_UPPER_FT
@@ -2072,9 +2071,7 @@ def run_obstacle_detection(
                         send_drive_command(b"STOP\n")
                         heights_tuple = height_state.get_heights() if height_state else None
                         if heights_tuple:
-                            height_text = (
-                                f"Heights: {heights_tuple[0]:.0f}-{heights_tuple[1]:.0f}mm"
-                            )
+                            height_text = f"Heights: {heights_tuple[0]:.1f}-{heights_tuple[1]:.1f}ft"
                         else:
                             height_text = "Heights: --"
                         cam_label = "FRONT CAM" if active_cam_idx == FRONT_CAM_INDEX else "REAR CAM"
@@ -2114,7 +2111,8 @@ def run_obstacle_detection(
                         else:
                             if estimated_height_ft is None:
                                 estimated_height_ft = lower_height_ft
-                            distance_mm = abs((tgt_ft - estimated_height_ft) * 304.8)
+                            distance_ft = abs(tgt_ft - estimated_height_ft)
+                            distance_mm = distance_ft * 304.8
                             duration_sec = distance_mm / max(LIFT_SPEED_MM_PER_SEC, 1.0)
                             duration_sec = max(LIFT_MOVE_MIN_SEC, min(LIFT_MOVE_MAX_SEC, duration_sec))
                             direction_cmd = LIFT_UP_COMMAND if tgt_ft > estimated_height_ft else LIFT_DOWN_COMMAND
@@ -2202,7 +2200,7 @@ def run_obstacle_detection(
 
                     heights_tuple = height_state.get_heights() if height_state else None
                     height_text = (
-                        f"Heights: {heights_tuple[0]:.0f}-{heights_tuple[1]:.0f}mm"
+                        f"Heights: {heights_tuple[0]:.1f}-{heights_tuple[1]:.1f}ft"
                         if heights_tuple
                         else "Heights: --"
                     )
