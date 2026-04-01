@@ -720,6 +720,10 @@ class FrameHub:
         with self._lock:
             self._frames[camera_name] = frame
 
+    def drop(self, camera_name: str) -> None:
+        with self._lock:
+            self._frames.pop(camera_name, None)
+
     def _snapshot(self) -> list[tuple[str, np.ndarray]]:
         with self._lock:
             return [(name, frame) for name, frame in self._frames.items() if frame is not None]
@@ -2248,9 +2252,11 @@ def run_obstacle_detection(
 
                     if frame_hub is not None:
                         frame_hub.update(camera_labels[i], rgb_frame)
+                        for j, label in enumerate(camera_labels):
+                            if j != active_cam_idx:
+                                frame_hub.drop(label)
                 else:
-                    if rgb_frame is not None and frame_hub is not None:
-                        frame_hub.update(camera_labels[i], rgb_frame)
+                    pass
 
     _cancel_lift_timer()
     if GUI_AVAILABLE:
