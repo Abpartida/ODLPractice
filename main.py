@@ -1923,6 +1923,8 @@ def run_obstacle_detection(
         stop_latched = False
         nav_enabled_prev = False
 
+        last_distance_mm = 9999
+
         while not should_quit:
             heights_ready_now = heights_ready()
             autonomous_mode = mode_state.is_autonomous() if mode_state is not None else True
@@ -1984,12 +1986,15 @@ def run_obstacle_detection(
                 in_rgb = rgb_qs[i].tryGet()
                 rgb_frame = in_rgb.getCvFrame() if in_rgb is not None else None
 
-                if i == active_cam_idx and in_depth is not None and rgb_frame is not None:
-                    depth_frame = in_depth.getFrame()
+                if i == active_cam_idx and rgb_frame is not None:
+                    depth_frame = in_depth.getFrame() if in_depth is not None else None
 
-                    obst_roi = depth_frame[OBST_ROI_Y : OBST_ROI_Y + OBST_ROI_H, OBST_ROI_X : OBST_ROI_X + OBST_ROI_W]
-                    valid_depths = obst_roi[obst_roi > 0]
-                    distance = int(np.percentile(valid_depths, 25)) if valid_depths.size else 9999
+                    distance = last_distance_mm
+                    if depth_frame is not None:
+                        obst_roi = depth_frame[OBST_ROI_Y : OBST_ROI_Y + OBST_ROI_H, OBST_ROI_X : OBST_ROI_X + OBST_ROI_W]
+                        valid_depths = obst_roi[obst_roi > 0]
+                        distance = int(np.percentile(valid_depths, 25)) if valid_depths.size else 9999
+                        last_distance_mm = distance
 
                     color_status = (0, 0, 255) if (0 < distance < SAFE_DISTANCE_MM) else (0, 255, 0)
                     cv2.rectangle(
@@ -1999,9 +2004,10 @@ def run_obstacle_detection(
                         color_status,
                         2,
                     )
+                    dist_label = f"Dist: {distance}mm" if depth_frame is not None else f"Dist: ~{distance}mm (last)"
                     cv2.putText(
                         rgb_frame,
-                        f"Dist: {distance}mm",
+                        dist_label,
                         (OBST_ROI_X, OBST_ROI_Y - 10),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
