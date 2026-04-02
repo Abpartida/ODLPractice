@@ -1797,6 +1797,7 @@ def run_obstacle_detection(
     last_lift_command: str | None = None
     last_lift_cmd_time = 0.0
     lidar_available = hasattr(esp32, "in_waiting") and hasattr(esp32, "readline")
+    last_drive_command: bytes | None = None
 
     DEFAULT_LOWER_FT = 1.5
     DEFAULT_UPPER_FT = 3.0
@@ -1822,11 +1823,16 @@ def run_obstacle_detection(
             return False
         return heights_ready()
 
-    def send_drive_command(command: bytes) -> None:
-        if not actuation_allowed():
+    def send_drive_command(command: bytes, *, force: bool = False) -> None:
+        nonlocal last_drive_command
+        if not force and not actuation_allowed():
+            last_drive_command = None
+            return
+        if not force and command == last_drive_command:
             return
         try:
             esp32.write(command)
+            last_drive_command = command
         except Exception as exc:
             print(f"[WARN] Failed to send drive command: {exc}")
 
@@ -1984,10 +1990,7 @@ def run_obstacle_detection(
 
             if not nav_enabled:
                 if esp32 and not stop_latched:
-                    try:
-                        esp32.write(b"STOP\n")
-                    except Exception:
-                        pass
+                    send_drive_command(b"STOP\n", force=True)
                     stop_latched = True
                 _cancel_lift_timer()
                 _send_lift_command(LIFT_STOP_COMMAND)
@@ -2300,7 +2303,7 @@ def run_obstacle_detection(
     if esp32:
         print("\nInitiating safe shutdown sequence...")
         try:
-            esp32.write(b"STOP\n")
+            send_drive_command(b"STOP\n", force=True)
         except Exception:
             pass
         time.sleep(0.1)
