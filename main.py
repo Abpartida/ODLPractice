@@ -72,7 +72,6 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 
 DRIVE_DEBUG_LOGS = _env_flag("DRIVE_DEBUG_LOGS", "1")
-DRIVE_HEARTBEAT_INTERVAL_SEC = _read_float_env("DRIVE_HEARTBEAT_INTERVAL_SEC", 0.2)
 
 
 def utc_now_iso(timespec: str = "seconds") -> str:
@@ -329,41 +328,6 @@ class SerialController:
                     pass
 
 
-class DriveHeartbeat:
-    """Re-sends the last drive command on a fixed cadence to satisfy firmware watchdogs."""
-
-    def __init__(self, serial_controller: SerialController, interval_sec: float) -> None:
-        self._serial = serial_controller
-        self._interval = max(interval_sec, 0.05)
-        self._lock = threading.Lock()
-        self._active_cmd: str | None = None
-        self._stop_event = threading.Event()
-        self._thread = threading.Thread(target=self._loop, name="drive-heartbeat", daemon=True)
-        self._thread.start()
-
-    def set_command(self, command: str | None) -> None:
-        with self._lock:
-            self._active_cmd = command if command else None
-
-    def clear(self) -> None:
-        self.set_command(None)
-
-    def stop(self) -> None:
-        self._stop_event.set()
-
-    def _loop(self) -> None:
-        while not self._stop_event.wait(self._interval):
-            cmd = None
-            with self._lock:
-                cmd = self._active_cmd
-            if cmd and cmd != "STOP":
-                ok, reply = self._serial.send(cmd)
-                if DRIVE_DEBUG_LOGS:
-                    print(
-                        f"[DRIVE] Heartbeat cmd={cmd} ok={ok} reply={reply}"
-                    )
-
-
 class SerialWriterAdapter:
     """Lightweight shim so other subsystems can reuse SerialController APIs."""
 
@@ -519,13 +483,11 @@ class ControlCommandDispatcher:
         serial_controller: SerialController,
         mode_state: ModeState,
         joystick_deadzone: float = JOYSTICK_DEADZONE,
-        drive_heartbeat: DriveHeartbeat | None = None,
         height_state: ObstacleHeightState | None = None,
     ) -> None:
         self._serial = serial_controller
         self._mode = mode_state
         self._deadzone = joystick_deadzone
-        self._drive_heartbeat = drive_heartbeat
         self._height_state = height_state
         self._ws_handlers: dict[str, Callable[[dict[str, Any]], CommandDispatchResult]] = {
             "drive": self._ws_drive,
@@ -560,7 +522,6 @@ class ControlCommandDispatcher:
             )
 
         ok, reply = result
-        self._update_drive_heartbeat(normalized, 200 if ok else 502)
         return CommandDispatchResult(
             200 if ok else 502,
             {
@@ -698,22 +659,12 @@ class ControlCommandDispatcher:
     def _handle_stop_command(self) -> CommandDispatchResult:
         flushed = self._serial.flush_drive_queue("STOP command preemption")
         ok, reply = self._serial.send("STOP")
-        if self._drive_heartbeat:
-            self._drive_heartbeat.clear()
         payload = {
             "command": "STOP",
             "serial_reply": reply,
             "flushed_jobs": flushed,
         }
         return CommandDispatchResult(200 if ok else 502, payload)
-
-    def _update_drive_heartbeat(self, command: str, status_code: int) -> None:
-        if not self._drive_heartbeat or status_code >= 400:
-            return
-        if command == "STOP":
-            self._drive_heartbeat.clear()
-        else:
-            self._drive_heartbeat.set_command(command)
 
     def _normalize_keyword(self, value: str) -> str:
         if not isinstance(value, str):
@@ -899,7 +850,6 @@ def create_app(
     frame_hub: FrameHub,
     mode_state: ModeState,
     db: DetectionDatabase,
-    drive_heartbeat: DriveHeartbeat | None = None,
     obstacle_heights: ObstacleHeightState | None = None,
 ) -> Flask:
     app = Flask(__name__)
@@ -907,7 +857,6 @@ def create_app(
     dispatcher = ControlCommandDispatcher(
         serial_controller,
         mode_state,
-        drive_heartbeat=drive_heartbeat,
         height_state=obstacle_heights,
     )
 
@@ -2372,13 +2321,11 @@ FRAME_HUB = FrameHub()
 MODE_STATE = ModeState()
 OBSTACLE_HEIGHTS = ObstacleHeightState()
 DETECTION_DB = DetectionDatabase(DB_PATH)
-DRIVE_HEARTBEAT = DriveHeartbeat(SERIAL_CONTROLLER, DRIVE_HEARTBEAT_INTERVAL_SEC)
 app = create_app(
     SERIAL_CONTROLLER,
     FRAME_HUB,
     MODE_STATE,
     DETECTION_DB,
-    DRIVE_HEARTBEAT,
     obstacle_heights=OBSTACLE_HEIGHTS,
 )
 
