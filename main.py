@@ -1890,7 +1890,7 @@ def _run_obstacle_detection_thread(
     FPS_LIMIT = 30
     should_quit = False
 
-    SAFE_DISTANCE_MM = 300
+    SAFE_DISTANCE_MM = 1800
     MIN_CONTOUR_AREA = 500
     MISSING_LINE_THRESHOLD = 30
 
