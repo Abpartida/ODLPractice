@@ -1559,16 +1559,17 @@ def partition_device_infos(
     obstacle_count: int = 2,
 ) -> tuple[list[dai.DeviceInfo], list[dai.DeviceInfo]]:
     """Split connected DepthAI devices between pest ID and obstacle detection roles."""
-    pest_devices = list(all_devices[:pest_count])
-    obstacle_devices = list(all_devices[pest_count : pest_count + obstacle_count])
+    # Obstacle cameras claim the earliest enumerated devices so their placement is deterministic.
+    obstacle_devices = list(all_devices[:obstacle_count])
+    pest_devices = list(all_devices[obstacle_count : obstacle_count + pest_count])
 
-    if len(pest_devices) < pest_count:
-        print(
-            f"[WARN] Requested {pest_count} pest-ID cameras but only {len(pest_devices)} device(s) available for that role."
-        )
     if len(obstacle_devices) < obstacle_count:
         print(
             f"[WARN] Requested {obstacle_count} obstacle cameras but only {len(obstacle_devices)} device(s) allocated."
+        )
+    if len(pest_devices) < pest_count:
+        print(
+            f"[WARN] Requested {pest_count} pest-ID cameras but only {len(pest_devices)} device(s) available for that role."
         )
 
     print(
