@@ -1,4 +1,4 @@
-from flask import Flask, Response
+from flask import Flask, Response, render_template
 import cv2
 import time
 
@@ -25,7 +25,11 @@ def video():
 
 @app.route('/')
 def index():
-    return '<h1>Live Stream</h1><img src="/video"/>'
+    return render_template(
+        'live_stream.html',
+        title='LYCO TOMI Live Stream',
+        stream_url='/video'
+    )
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, threaded=True)

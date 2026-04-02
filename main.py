@@ -24,7 +24,7 @@ from typing import Any, Callable, Iterable
 import cv2
 import depthai as dai
 import numpy as np
-from flask import Flask, Response, abort, jsonify, request
+from flask import Flask, Response, abort, jsonify, render_template, request
 from flask_sock import Sock
 from simple_websocket import ConnectionClosed
 import serial
@@ -1004,7 +1004,11 @@ def create_app(
 
     @app.route("/")
     def index():
-        return "<h1>Live Stream</h1><img src=\"/video\"/>"
+        return render_template(
+            "live_stream.html",
+            title="LYCO TOMI Live Stream",
+            stream_url="/video",
+        )
 
     @sock.route("/ws/control")
     def control_websocket(ws):
