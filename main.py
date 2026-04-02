@@ -73,6 +73,10 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 DRIVE_DEBUG_LOGS = _env_flag("DRIVE_DEBUG_LOGS", "1")
 
+# Shared flag so other subsystems (e.g., WebSocket handlers) know when the
+# obstacle loop actively manages actuators.
+OBSTACLE_THREAD_ACTIVE = threading.Event()
+
 
 def utc_now_iso(timespec: str = "seconds") -> str:
     """Return an ISO 8601 UTC timestamp with a 'Z' suffix."""
@@ -484,11 +488,13 @@ class ControlCommandDispatcher:
         mode_state: ModeState,
         joystick_deadzone: float = JOYSTICK_DEADZONE,
         height_state: ObstacleHeightState | None = None,
+        autonomy_guard: threading.Event | None = None,
     ) -> None:
         self._serial = serial_controller
         self._mode = mode_state
         self._deadzone = joystick_deadzone
         self._height_state = height_state
+        self._autonomy_guard = autonomy_guard
         self._ws_handlers: dict[str, Callable[[dict[str, Any]], CommandDispatchResult]] = {
             "drive": self._ws_drive,
             "lift": self._ws_lift,
@@ -693,7 +699,29 @@ class ControlCommandDispatcher:
     def _error_result(self, message: str, status_code: int = 400) -> CommandDispatchResult:
         return CommandDispatchResult(status_code, {"error": message})
 
+    def _ws_manual_override_guard(self, topic: str) -> CommandDispatchResult | None:
+        guard = self._autonomy_guard
+        if guard and guard.is_set() and self._mode.is_autonomous():
+            return CommandDispatchResult(
+                423,
+                {
+                    "error": f"{topic} overrides are disabled while obstacle navigation is active in autonomous mode.",
+                    "mode": self._mode.get_mode(),
+                    "obstacle_thread_active": True,
+                },
+            )
+        return None
+
     def _ws_drive(self, payload: dict[str, Any]) -> CommandDispatchResult:
+        blocked = self._ws_manual_override_guard("drive")
+        if blocked:
+            command = payload.get("command") or payload.get("direction") or payload.get("action")
+            if command:
+                blocked.payload.setdefault("command", command)
+            axes = payload.get("axes")
+            if axes:
+                blocked.payload.setdefault("joystick", axes)
+            return blocked
         command = payload.get("command") or payload.get("direction") or payload.get("action")
         if isinstance(command, str) and command.strip():
             return self.execute_drive_command(command)
@@ -714,12 +742,24 @@ class ControlCommandDispatcher:
         return self.execute_drive_from_axes(ax or 0.0, ay or 0.0)
 
     def _ws_lift(self, payload: dict[str, Any]) -> CommandDispatchResult:
+        blocked = self._ws_manual_override_guard("lift")
+        if blocked:
+            verb_candidate = payload.get("command") or payload.get("action")
+            if verb_candidate:
+                blocked.payload.setdefault("command", verb_candidate)
+            return blocked
         verb = payload.get("command") or payload.get("action")
         if not isinstance(verb, str):
             return self._error_result("Lift messages must include a 'command'.")
         return self.execute_lift_command(verb)
 
     def _ws_fan(self, payload: dict[str, Any]) -> CommandDispatchResult:
+        blocked = self._ws_manual_override_guard("fan")
+        if blocked:
+            verb_candidate = payload.get("command") or payload.get("state")
+            if verb_candidate:
+                blocked.payload.setdefault("command", verb_candidate)
+            return blocked
         verb = payload.get("command") or payload.get("state")
         if not isinstance(verb, str):
             return self._error_result("Fan messages must include 'command' or 'state'.")
@@ -851,6 +891,7 @@ def create_app(
     mode_state: ModeState,
     db: DetectionDatabase,
     obstacle_heights: ObstacleHeightState | None = None,
+    obstacle_guard: threading.Event | None = None,
 ) -> Flask:
     app = Flask(__name__)
     sock = Sock(app)
@@ -858,6 +899,7 @@ def create_app(
         serial_controller,
         mode_state,
         height_state=obstacle_heights,
+        autonomy_guard=obstacle_guard,
     )
 
     def _json_response(result: CommandDispatchResult):
@@ -1731,7 +1773,7 @@ def start_pipeline(
 # ======================================================================================
 
 
-def run_obstacle_detection(
+def _run_obstacle_detection_thread(
     serial_controller: SerialController | None,
     device_infos_override: list[dai.DeviceInfo] | None = None,
     mode_state: ModeState | None = None,
@@ -2314,6 +2356,27 @@ def run_obstacle_detection(
         print("Actuators disengaged. Offline.")
 
 
+def run_obstacle_detection(
+    serial_controller: SerialController | None,
+    device_infos_override: list[dai.DeviceInfo] | None = None,
+    mode_state: ModeState | None = None,
+    frame_hub: FrameHub | None = None,
+    height_state: ObstacleHeightState | None = None,
+) -> None:
+    """Wrapper that marks the obstacle loop as active for manual override guards."""
+    OBSTACLE_THREAD_ACTIVE.set()
+    try:
+        _run_obstacle_detection_thread(
+            serial_controller,
+            device_infos_override,
+            mode_state,
+            frame_hub,
+            height_state,
+        )
+    finally:
+        OBSTACLE_THREAD_ACTIVE.clear()
+
+
 # ======================================================================================
 # Application bootstrap
 # ======================================================================================
@@ -2333,6 +2396,7 @@ app = create_app(
     MODE_STATE,
     DETECTION_DB,
     obstacle_heights=OBSTACLE_HEIGHTS,
+    obstacle_guard=OBSTACLE_THREAD_ACTIVE,
 )
 
 
