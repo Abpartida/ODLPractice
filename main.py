@@ -1866,8 +1866,11 @@ def run_obstacle_detection(
     def _send_lift_command(cmd: str, min_interval_sec: float = 0.2) -> None:
         nonlocal last_lift_command, last_lift_cmd_time
         now = time.time()
-        if last_lift_command == cmd and (now - last_lift_cmd_time) < min_interval_sec:
-            return
+        if last_lift_command == cmd:
+            if cmd == LIFT_STOP_COMMAND:
+                return
+            if (now - last_lift_cmd_time) < min_interval_sec:
+                return
         _write_ascii_command(cmd)
         last_lift_command = cmd
         last_lift_cmd_time = now
