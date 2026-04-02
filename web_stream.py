@@ -28,7 +28,9 @@ def index():
     return render_template(
         'live_stream.html',
         title='LYCO TOMI Live Stream',
-        stream_url='/video'
+        stream_url='/video',
+        stream_enabled=True,
+        stream_control_url='',
     )
 
 if __name__ == '__main__':

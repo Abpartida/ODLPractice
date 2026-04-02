@@ -72,6 +72,7 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 
 DRIVE_DEBUG_LOGS = _env_flag("DRIVE_DEBUG_LOGS", "1")
+STREAM_CAMERA_FEED_DEFAULT = _env_flag("STREAM_CAMERA_FEED", "1")
 
 # Shared flag so other subsystems (e.g., WebSocket handlers) know when the
 # obstacle loop actively manages actuators.
@@ -881,6 +882,39 @@ class FrameHub:
 
 
 # ======================================================================================
+# Stream Control Helpers
+# ======================================================================================
+
+
+class StreamGate:
+    """Thread-safe gate that controls whether MJPEG streaming is allowed."""
+
+    def __init__(self, enabled: bool):
+        self._enabled = bool(enabled)
+        self._lock = threading.Lock()
+
+    def is_enabled(self) -> bool:
+        with self._lock:
+            return self._enabled
+
+    def set(self, enabled: bool) -> bool:
+        with self._lock:
+            self._enabled = bool(enabled)
+            return self._enabled
+
+    def enable(self) -> bool:
+        return self.set(True)
+
+    def disable(self) -> bool:
+        return self.set(False)
+
+    def toggle(self) -> bool:
+        with self._lock:
+            self._enabled = not self._enabled
+            return self._enabled
+
+
+# ======================================================================================
 # Flask Application
 # ======================================================================================
 
@@ -888,6 +922,7 @@ class FrameHub:
 def create_app(
     serial_controller: SerialController,
     frame_hub: FrameHub,
+    stream_gate: StreamGate,
     mode_state: ModeState,
     db: DetectionDatabase,
     obstacle_heights: ObstacleHeightState | None = None,
@@ -904,6 +939,25 @@ def create_app(
 
     def _json_response(result: CommandDispatchResult):
         return jsonify(result.payload), result.status_code
+
+    def _stream_state_payload() -> dict[str, Any]:
+        return {
+            "enabled": stream_gate.is_enabled(),
+            "timestamp": utc_now_iso("seconds"),
+        }
+
+    def _parse_bool(value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        return None
 
     @app.post("/auth/login")
     def auth_login():
@@ -1000,15 +1054,49 @@ def create_app(
 
     @app.route("/video")
     def video():
-        return Response(frame_hub.stream_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+        if not stream_gate.is_enabled():
+            abort(404, description="Camera streaming disabled by configuration.")
+
+        def _stream_generator():
+            for payload in frame_hub.stream_frames():
+                if not stream_gate.is_enabled():
+                    break
+                yield payload
+
+        return Response(_stream_generator(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
     @app.route("/")
     def index():
+        stream_enabled = stream_gate.is_enabled()
+        stream_url = "/video"
         return render_template(
             "live_stream.html",
             title="LYCO TOMI Live Stream",
-            stream_url="/video",
+            stream_url=stream_url,
+            stream_enabled=stream_enabled,
+            stream_control_url="/api/stream/state",
         )
+
+    @app.get("/api/stream/state")
+    def api_stream_get_state():
+        return jsonify(_stream_state_payload())
+
+    @app.post("/api/stream/state")
+    def api_stream_update_state():
+        data = request.get_json(silent=True) or {}
+        desired = _parse_bool(data.get("enabled"))
+        action = str(data.get("action") or data.get("command") or data.get("state") or "").strip().lower()
+
+        if desired is not None:
+            stream_gate.set(desired)
+        elif action in {"pause", "disable", "off", "stop"}:
+            stream_gate.disable()
+        elif action in {"resume", "enable", "on", "start"}:
+            stream_gate.enable()
+        elif action == "toggle" or not action:
+            stream_gate.toggle()
+
+        return jsonify(_stream_state_payload())
 
     @sock.route("/ws/control")
     def control_websocket(ws):
@@ -2392,12 +2480,14 @@ SERIAL_CONTROLLER = SerialController(
     timeout_sec=SERIAL_TIMEOUT_SEC,
 )
 FRAME_HUB = FrameHub()
+STREAM_GATE = StreamGate(STREAM_CAMERA_FEED_DEFAULT)
 MODE_STATE = ModeState()
 OBSTACLE_HEIGHTS = ObstacleHeightState()
 DETECTION_DB = DetectionDatabase(DB_PATH)
 app = create_app(
     SERIAL_CONTROLLER,
     FRAME_HUB,
+    STREAM_GATE,
     MODE_STATE,
     DETECTION_DB,
     obstacle_heights=OBSTACLE_HEIGHTS,

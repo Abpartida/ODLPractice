@@ -27,8 +27,10 @@
             justify-content: center;
             background: radial-gradient(circle at top, #ffe6d7, #fbd1b7 45%, #f7b18a 100%);
             position: relative;
-            overflow: hidden;
+            overflow-x: hidden;
+            overflow-y: auto;
             color: var(--tomato-dark);
+            padding: 48px 16px;
         }
 
         body::before {
@@ -53,6 +55,7 @@
             border: 4px solid rgba(214, 40, 40, 0.2);
             position: relative;
             z-index: 1;
+            margin: auto;
         }
 
         .title-row {
@@ -113,11 +116,62 @@
             box-shadow: 0 8px 18px rgba(214,40,40,0.35);
         }
 
+        .stream-frame.offline {
+            border-color: rgba(104, 59, 59, 0.35);
+            background: rgba(0, 0, 0, 0.75);
+        }
+
+        .stream-frame.offline::after {
+            content: "Offline";
+            background: #6c6c6c;
+            box-shadow: 0 8px 18px rgba(0,0,0,0.35);
+        }
+
         img.stream {
             display: block;
             width: 100%;
             height: auto;
             background: #0b0b0b;
+        }
+
+        .stream-status-banner {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            padding: 16px 20px;
+            margin: 0 0 18px;
+            border-radius: 18px;
+            background: rgba(214, 40, 40, 0.1);
+            border: 1px solid rgba(214, 40, 40, 0.4);
+            color: var(--tomato-dark);
+        }
+
+        .stream-status-banner .indicator {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            border: 4px solid #f7d8c7;
+            position: relative;
+            animation: pulse 1.6s infinite;
+            }
+
+        .stream-status-banner strong {
+            display: block;
+            font-size: 1.05rem;
+            letter-spacing: 0.04em;
+        }
+
+        .stream-status-banner span {
+            display: block;
+            font-size: 0.95rem;
+            color: #7c4b3f;
+            margin-top: 4px;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(0.9); opacity: 0.6; }
+            50% { transform: scale(1.1); opacity: 1; }
+            100% { transform: scale(0.9); opacity: 0.6; }
         }
 
         .footer {
@@ -143,9 +197,43 @@
             box-shadow: 0 0 0 4px rgba(106,153,78,0.25);
         }
 
+        .controls {
+            display: flex;
+            justify-content: flex-end;
+            margin-bottom: 16px;
+        }
+
+        .toggle-button {
+            border: none;
+            border-radius: 999px;
+            padding: 10px 24px;
+            font-size: 0.95rem;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            color: #fff;
+            background: linear-gradient(120deg, var(--leaf-green), var(--stem-green));
+            cursor: pointer;
+            box-shadow: 0 12px 24px rgba(45, 106, 79, 0.35);
+            transition: transform 0.18s ease, box-shadow 0.18s ease, opacity 0.18s ease;
+        }
+
+        .toggle-button:hover:not(:disabled) {
+            transform: translateY(-1px);
+            box-shadow: 0 18px 30px rgba(45, 106, 79, 0.35);
+        }
+
+        .toggle-button:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+            box-shadow: none;
+        }
+
         @media (max-width: 640px) {
             .card {
                 padding: 24px;
+            }
+            body {
+                padding: 32px 12px 48px;
             }
             .stream-frame::after {
                 top: 12px;
@@ -161,12 +249,40 @@
             <h1>{{ title }}</h1>
         </div>
         <p class="description">
-            Welcome to the LYCO TOMI greenhouse observatory. Enjoy a ripe, real-time glimpse of the grow
-            lanes streamed directly from the canopy cams. The stream refreshes automatically, so just sit back
+            Welcome to the LYCO TOMI greenhouse live feed. Enjoy a ripe, real-time glimpse of the grow
+            lanes streamed directly from the rover cams. The stream refreshes automatically, so just sit back
             and watch the tomatoes thrive.
         </p>
-        <div class="stream-frame" aria-live="polite">
-            <img class="stream" src="{{ stream_url }}" alt="Tomato greenhouse live feed" />
+        <div class="stream-status-banner" role="status" {% if stream_enabled %}hidden{% endif %}>
+            <div class="indicator" aria-hidden="true"></div>
+            <div>
+                <strong class="stream-status-heading">Live feed paused</strong>
+                <span class="stream-status-body">The cameras are still running but streaming is disabled.</span>
+            </div>
+        </div>
+        <div class="controls">
+            <button
+                id="toggle-stream"
+                class="toggle-button"
+                type="button"
+                data-control-url="{{ stream_control_url or '' }}"
+                data-initial-enabled="{{ 'true' if stream_enabled else 'false' }}"
+                aria-pressed="{{ 'false' if stream_enabled else 'true' }}"
+            >
+                {{ "Pause Live Feed" if stream_enabled else "Resume Live Feed" }}
+            </button>
+        </div>
+        <div class="stream-frame {% if not stream_enabled %}offline{% endif %}" aria-live="polite">
+            <img
+                class="stream"
+                data-stream-url="{{ stream_url or '' }}"
+                alt="Tomato greenhouse live feed"
+                {% if stream_enabled %}
+                src="{{ stream_url }}"
+                {% else %}
+                hidden
+                {% endif %}
+            />
         </div>
         <div class="footer">
             <span><span class="dot" aria-hidden="true"></span>Organic vision stream</span>
@@ -174,5 +290,88 @@
             <span><span class="dot" aria-hidden="true" style="background: var(--tomato-light);"></span>Auto-refreshing every frame</span>
         </div>
     </div>
+    <script>
+        (() => {
+            const toggleBtn = document.getElementById("toggle-stream");
+            const streamFrame = document.querySelector(".stream-frame");
+            const streamImg = streamFrame ? streamFrame.querySelector("img.stream") : null;
+            const placeholder = document.querySelector(".stream-status-banner");
+            const placeholderHeading = placeholder ? placeholder.querySelector(".stream-status-heading") : null;
+            const placeholderBody = placeholder ? placeholder.querySelector(".stream-status-body") : null;
+            if (!toggleBtn || !streamFrame || !streamImg) {
+                return;
+            }
+
+            const controlUrl = toggleBtn.dataset.controlUrl || "";
+            const baseUrl = streamImg.dataset.streamUrl || "";
+            let isEnabled = toggleBtn.dataset.initialEnabled === "true";
+
+            const updateUi = (enabled) => {
+                isEnabled = enabled;
+                toggleBtn.textContent = enabled ? "Pause Live Feed" : "Resume Live Feed";
+                toggleBtn.setAttribute("aria-pressed", enabled ? "false" : "true");
+                streamFrame.classList.toggle("offline", !enabled);
+                if (placeholder) {
+                    placeholder.hidden = enabled;
+                    if (placeholderHeading) {
+                        placeholderHeading.textContent = enabled ? "Live feed active" : "Live feed paused";
+                    }
+                    if (placeholderBody) {
+                        placeholderBody.textContent = enabled
+                            ? "Streaming is enabled and frames will appear shortly."
+                            : "The cameras are still running but streaming is disabled.";
+                    }
+                }
+
+                if (!baseUrl) {
+                    return;
+                }
+
+                if (enabled) {
+                    streamImg.hidden = false;
+                    streamImg.src = `${baseUrl}?ts=${Date.now()}`;
+                } else {
+                    streamImg.removeAttribute("src");
+                    streamImg.hidden = true;
+                }
+            };
+
+            updateUi(isEnabled);
+
+            const requestStateChange = async (desired) => {
+                if (!controlUrl) {
+                    updateUi(desired);
+                    return desired;
+                }
+                const resp = await fetch(controlUrl, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify({ enabled: desired }),
+                });
+                if (!resp.ok) {
+                    throw new Error("Failed to update stream state");
+                }
+                const payload = await resp.json();
+                const next = Boolean(payload.enabled);
+                updateUi(next);
+                return next;
+            };
+
+            toggleBtn.addEventListener("click", async () => {
+                const targetState = !isEnabled;
+                toggleBtn.disabled = true;
+                try {
+                    await requestStateChange(targetState);
+                } catch (err) {
+                    console.error(err);
+                    updateUi(isEnabled);
+                } finally {
+                    toggleBtn.disabled = false;
+                }
+            });
+        })();
+    </script>
 </body>
 </html>

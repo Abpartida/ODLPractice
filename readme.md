@@ -24,6 +24,7 @@ You can override defaults through environment variables:
 | `OPEN_BROWSER` | `1` | Set to `0` to skip auto-opening the MJPEG viewer. |
 | `BROWSER_URL` | `http://127.0.0.1:5000/` | Page opened after the app starts. |
 | `BROWSER_CMD` | *(empty)* | Optional custom browser command (e.g. `BROWSER_CMD="/Applications/Firefox.app/Contents/MacOS/firefox"`). |
+| `STREAM_CAMERA_FEED` | `1` | Set to `0` to keep the DepthAI pipelines running but disable the `/video` MJPEG endpoint. |
 | `VENV_DIR/.deps-installed` | *(file)* | Timestamp marker; delete it to force a dependency refresh. |
 
 ### Option B: manual setup
@@ -56,7 +57,9 @@ Running `main.py` exposes both the MJPEG composite and JSON endpoints on `http:/
 
 ### Live stream
 - `GET /video` – multipart MJPEG with the latest 2×2 grid of cameras.
-- `GET /` – minimal HTML wrapper that just embeds `/video`.
+- `GET /` – minimal HTML wrapper that just embeds `/video` and exposes a Pause/Resume control.
+- `GET /api/stream/state` – returns `{enabled: bool, timestamp: ...}` so dashboards can poll the streaming state.
+- `POST /api/stream/state` – accepts `{"enabled": true|false}` or `{"action": "pause|resume|toggle"}` to control the live feed. The Pause button on `/` calls this endpoint so operators can stop streaming without killing the camera threads.
 
 ### Drive + actuator control
 Manual drive commands now travel over a persistent WebSocket: `ws://<host>:5000/ws/control`. Every JSON message requires a `type` field so the dispatcher knows which subsystem to target, and the server replies with `status`, the raw `serial_reply`, and the current rover `mode`.
