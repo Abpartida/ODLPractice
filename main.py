@@ -2072,7 +2072,7 @@ def _run_obstacle_detection_thread(
             stereo.setLeftRightCheck(True)
             stereo.setSubpixel(False)
             stereo.setDepthAlign(dai.CameraBoardSocket.RGB)
-
+            stereo.setOutputSize(640, 480)
             left.out.link(stereo.left)
             right.out.link(stereo.right)
 
