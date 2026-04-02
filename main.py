@@ -82,7 +82,7 @@ def utc_now_iso(timespec: str = "seconds") -> str:
 # Default actuator commands (override via env vars if firmware differs)
 GUI_AVAILABLE = bool(os.environ.get("DISPLAY")) and os.environ.get("QT_QPA_PLATFORM", "").lower() != "offscreen"
 FAN_ON_COMMAND = os.environ.get("FAN_ON_COMMAND", "FAN")
-FAN_OFF_COMMAND = os.environ.get("FAN_OFF_COMMAND", "STOP")
+FAN_OFF_COMMAND = os.environ.get("FAN_OFF_COMMAND", "FAN_OFF")
 LIFT_UP_COMMAND = os.environ.get("LIFT_UP_COMMAND", "UP")
 LIFT_DOWN_COMMAND = os.environ.get("LIFT_DOWN_COMMAND", "DOWN")
 LIFT_STOP_COMMAND = os.environ.get("LIFT_STOP_COMMAND", "STOP")
@@ -113,7 +113,9 @@ class SerialController:
         self._serial: serial.Serial | None = None
         self._drive_queue: "Queue[SerialJob]" = Queue(maxsize=DRIVE_QUEUE_SIZE)
         self._drive_worker_thread: threading.Thread | None = None
-        self._rx_flush_since_write = True
+        self._rx_thread: threading.Thread | None = None
+        self._rx_stop_event = threading.Event()
+        self._rx_queue: "Queue[bytes]" = Queue(maxsize=256)
 
     # ------------------------------------------------------------------
     # Public API
@@ -124,17 +126,10 @@ class SerialController:
             self._open_serial()
             if self._serial is None or not self._serial.is_open:
                 return False, "Serial not connected"
-
-            # Drop any pending RX bytes so the ESP32 never blocks waiting for us to
-            # read its acknowledgements. A backed-up RX buffer manifests as write
-            # timeouts that make drive commands feel sluggish.
-            if not self._rx_flush_since_write:
-                self._reset_serial_input_unlocked()
             try:
                 payload = (cmd.strip() + "\n").encode("utf-8")
                 self._serial.write(payload)
                 self._serial.flush()
-                self._rx_flush_since_write = False
                 return True, "sent"
             except (SerialException, OSError) as exc:
                 try:
@@ -260,9 +255,9 @@ class SerialController:
             time.sleep(2.3)  # allow board reset + boot chatter
             try:
                 self._serial.reset_input_buffer()
-                self._rx_flush_since_write = True
             except Exception:
                 pass
+            self._ensure_rx_thread_started_unlocked()
         except SerialException as exc:
             self._serial = None
             print(f"[ERROR] Failed to open serial {self.port}: {exc}")
@@ -280,7 +275,58 @@ class SerialController:
         """Public hook so other components can flush stale serial data."""
         with self._serial_lock:
             self._reset_serial_input_unlocked()
-            self._rx_flush_since_write = True
+        while not self._rx_queue.empty():
+            try:
+                self._rx_queue.get_nowait()
+            except Empty:
+                break
+
+    def readline(self) -> bytes:
+        try:
+            return self._rx_queue.get_nowait()
+        except Empty:
+            return b""
+
+    @property
+    def in_waiting(self) -> int:
+        return self._rx_queue.qsize()
+
+    def _ensure_rx_thread_started_unlocked(self) -> None:
+        if self._rx_thread and self._rx_thread.is_alive():
+            return
+        self._rx_stop_event.clear()
+        self._rx_thread = threading.Thread(target=self._rx_worker_loop, name="serial-rx", daemon=True)
+        self._rx_thread.start()
+
+    def _rx_worker_loop(self) -> None:
+        while not self._rx_stop_event.is_set():
+            with self._serial_lock:
+                serial_obj = self._serial if self._serial and self._serial.is_open else None
+            if not serial_obj:
+                time.sleep(0.1)
+                continue
+            try:
+                line = serial_obj.readline()
+            except (SerialException, OSError):
+                time.sleep(0.1)
+                continue
+            if not line:
+                time.sleep(0.01)
+                continue
+            decoded = line.decode("utf-8", errors="ignore").strip()
+            if decoded:
+                print(f"[ESP32] {decoded}")
+            try:
+                self._rx_queue.put_nowait(line)
+            except Full:
+                try:
+                    self._rx_queue.get_nowait()
+                except Empty:
+                    pass
+                try:
+                    self._rx_queue.put_nowait(line)
+                except Full:
+                    pass
 
 
 class DriveHeartbeat:
@@ -333,6 +379,17 @@ class SerialWriterAdapter:
             return
         if command:
             self._controller.send(command)
+
+    def readline(self) -> bytes:
+        if not self._controller:
+            return b""
+        return self._controller.readline()
+
+    @property
+    def in_waiting(self) -> int:
+        if not self._controller:
+            return 0
+        return self._controller.in_waiting
 
     def reset_input_buffer(self) -> None:  # pragma: no cover - compatibility shim
         if self._controller:
@@ -441,7 +498,21 @@ class CommandDispatchResult:
 class ControlCommandDispatcher:
     """Shared command processor for HTTP + WebSocket control surfaces."""
 
-    _DRIVE_COMMANDS = {"FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP"}
+    _DRIVE_COMMANDS = {
+        "FORWARD",
+        "BACKWARD",
+        "LEFT",
+        "RIGHT",
+        "STOP",
+        "ARC_LEFT",
+        "ARC_RIGHT",
+        "ARC_REV_LEFT",
+        "ARC_REV_RIGHT",
+        "TIGHT_ARC_LEFT",
+        "TIGHT_ARC_RIGHT",
+        "TIGHT_ARC_REV_LEFT",
+        "TIGHT_ARC_REV_RIGHT",
+    }
 
     def __init__(
         self,
@@ -1806,21 +1877,9 @@ def run_obstacle_detection(
         if not actuation_allowed():
             return
         try:
-            esp32.reset_input_buffer()
-        except Exception:
-            pass
-        try:
             esp32.write(command)
         except Exception as exc:
             print(f"[WARN] Failed to send drive command: {exc}")
-
-    def send_spd(throttle_speed: int) -> None:
-        if not actuation_allowed():
-            return
-        try:
-            esp32.write(f"SPD:{throttle_speed}\n".encode("utf-8"))
-        except Exception as exc:
-            print(f"[WARN] Failed to send SPD command: {exc}")
 
     def _write_ascii_command(command: str) -> None:
         if not esp32:
@@ -2186,8 +2245,6 @@ def run_obstacle_detection(
 
                         elif line_detected:
                             missing_line_frames = 0
-                            throttle_speed = int(np.interp(cy, [0, LINE_ROI_H], [127, 40]))
-                            send_spd(throttle_speed)
 
                             if active_cam_idx == FRONT_CAM_INDEX:
                                 if error < -100:
