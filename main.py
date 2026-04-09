@@ -1934,6 +1934,12 @@ def _run_obstacle_detection_thread(
     STATE_ROW_RETURN = 1
     STATE_AISLE_TRANSIT = 2
     current_nav_state = STATE_ROW_OUTWARD
+    TURN_GREEN_LIMIT = 3
+    FINAL_STOP_HEIGHT_FT = 2.0
+    turn_green_counter = 0
+    awaiting_green_stop = False
+    final_green_stop_latched = False
+    green_detection_latched = False
 
     device_infos = device_infos_override if device_infos_override is not None else dai.Device.getAllAvailableDevices()
     if len(device_infos) > 2:
@@ -1955,6 +1961,22 @@ def _run_obstacle_detection_thread(
     REAR_CAM_INDEX = 0
     active_cam_idx = FRONT_CAM_INDEX
     missing_line_frames = 0
+
+    def reset_green_turn_tracking() -> None:
+        nonlocal turn_green_counter, awaiting_green_stop, final_green_stop_latched, green_detection_latched
+        turn_green_counter = 0
+        awaiting_green_stop = False
+        final_green_stop_latched = False
+        green_detection_latched = False
+
+    def format_turn_counter() -> str:
+        count = min(turn_green_counter, TURN_GREEN_LIMIT)
+        label = f"Turns: {count}/{TURN_GREEN_LIMIT}"
+        if final_green_stop_latched:
+            label += " (complete)"
+        elif awaiting_green_stop:
+            label += " (await green)"
+        return label
 
     lift_timer_lock = threading.Lock()
     lift_stop_timer: threading.Timer | None = None
@@ -2144,6 +2166,9 @@ def _run_obstacle_detection_thread(
             elif not autonomous_mode:
                 nav_wait_reason = "Waiting for autonomous mode"
 
+            if not autonomous_mode:
+                reset_green_turn_tracking()
+
             pause_remaining = OBSTACLE_PAUSE_CTRL.remaining()
             if pause_remaining > 0:
                 nav_enabled = False
@@ -2213,6 +2238,7 @@ def _run_obstacle_detection_thread(
                         cv2.putText(rgb_frame, target_color_text, (450, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                         cv2.putText(rgb_frame, status, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
                         cv2.putText(rgb_frame, height_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                        cv2.putText(rgb_frame, format_turn_counter(), (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (135, 206, 250), 2)
                         if GUI_AVAILABLE:
                             cv2.imshow("Robot View", rgb_frame)
                             if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -2316,6 +2342,27 @@ def _run_obstacle_detection_thread(
                                     (0, 255, 0),
                                     3,
                                 )
+
+                    final_stop_triggered = False
+                    green_line_seen = (
+                        nav_enabled
+                        and autonomous_mode
+                        and current_nav_state == STATE_AISLE_TRANSIT
+                        and line_detected
+                        and not final_green_stop_latched
+                    )
+                    if green_line_seen and not green_detection_latched:
+                        green_detection_latched = True
+                        turn_green_counter += 1
+                        if turn_green_counter >= TURN_GREEN_LIMIT and not final_green_stop_latched:
+                            if awaiting_green_stop:
+                                awaiting_green_stop = False
+                                final_green_stop_latched = True
+                                final_stop_triggered = True
+                            else:
+                                awaiting_green_stop = True
+                    elif not green_line_seen:
+                        green_detection_latched = False
 
                     nav_enabled_prev = nav_enabled
 
@@ -2428,6 +2475,16 @@ def _run_obstacle_detection_thread(
 
                                 time.sleep(0.5)
 
+                    if final_stop_triggered:
+                        status = "Stopping on green target"
+                        command_to_send = b"STOP\n"
+                        lift_status = f"Lowering to {FINAL_STOP_HEIGHT_FT:.2f}ft"
+                        _begin_height_adjustment(FINAL_STOP_HEIGHT_FT)
+                    elif final_green_stop_latched:
+                        command_to_send = b"STOP\n"
+                        if not status:
+                            status = "Final green reached"
+
                     send_drive_command(command_to_send)
 
                     if lift_status is None and not actuation_allowed():
@@ -2452,6 +2509,7 @@ def _run_obstacle_detection_thread(
                         cv2.putText(rgb_frame, height_text, (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
                     else:
                         cv2.putText(rgb_frame, height_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                    cv2.putText(rgb_frame, format_turn_counter(), (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (135, 206, 250), 2)
 
                     if GUI_AVAILABLE:
                         cv2.imshow("Robot View", rgb_frame)
