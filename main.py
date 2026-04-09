@@ -79,6 +79,33 @@ STREAM_CAMERA_FEED_DEFAULT = _env_flag("STREAM_CAMERA_FEED", "1")
 OBSTACLE_THREAD_ACTIVE = threading.Event()
 
 
+class ObstaclePauseController:
+    """Tracks timed pause requests for the obstacle detection loop."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._resume_at = 0.0
+
+    def pause_for(self, duration_sec: float) -> None:
+        if duration_sec <= 0:
+            return
+        resume_at = time.monotonic() + duration_sec
+        with self._lock:
+            if resume_at > self._resume_at:
+                self._resume_at = resume_at
+
+    def remaining(self) -> float:
+        with self._lock:
+            remaining = self._resume_at - time.monotonic()
+        return remaining if remaining > 0 else 0.0
+
+    def is_paused(self) -> bool:
+        return self.remaining() > 0.0
+
+
+OBSTACLE_PAUSE_CTRL = ObstaclePauseController()
+
+
 def utc_now_iso(timespec: str = "seconds") -> str:
     """Return an ISO 8601 UTC timestamp with a 'Z' suffix."""
     return datetime.now(timezone.utc).isoformat(timespec=timespec).replace("+00:00", "Z")
@@ -1322,9 +1349,10 @@ def _build_aruco_detector() -> tuple[Any, Any, Any, Any]:
 aruco_module, aruco_dict, aruco_detector, aruco_params = _build_aruco_detector()
 
 TRAP_REGISTRY: dict[int, dict[str, str]] = {
-    0: {"name": "Trap A", "location": "North block, row 2"},
-    1: {"name": "Trap B", "location": "North block, row 5"},
-    2: {"name": "Trap C", "location": "East block, row 1"},
+    0: {"name": "Trap A", "location": "First block, row 1"},
+    1: {"name": "Trap B", "location": "Second block, row 1"},
+    2: {"name": "Trap C", "location": "Third block, row 1"},
+    4: {"name": "Trap D", "location": "Fourth block, row 1"},
 }
 
 use_xlink = hasattr(dai.node, "XLinkOut")
@@ -1811,6 +1839,7 @@ def start_pipeline(
 
                 trap_detections = detect_pest_traps(frame)
                 if trap_detections:
+                    OBSTACLE_PAUSE_CTRL.pause_for(5.0)
                     annotate_traps(frame, trap_detections, active["name"])
                     for trap_det in trap_detections:
                         db.record_trap_sighting(
@@ -2114,6 +2143,11 @@ def _run_obstacle_detection_thread(
                 nav_wait_reason = "Waiting for height input"
             elif not autonomous_mode:
                 nav_wait_reason = "Waiting for autonomous mode"
+
+            pause_remaining = OBSTACLE_PAUSE_CTRL.remaining()
+            if pause_remaining > 0:
+                nav_enabled = False
+                nav_wait_reason = f"Paused for traps ({pause_remaining:.1f}s)"
 
             if nav_enabled and not nav_enabled_prev and target_height_ft is not None:
                 is_adjusting_height = bool(esp32)
