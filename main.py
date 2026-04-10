@@ -105,6 +105,13 @@ class ObstaclePauseController:
 
 OBSTACLE_PAUSE_CTRL = ObstaclePauseController()
 
+YELLOW_PAUSE_DURATION_SEC = _read_float_env("YELLOW_PAUSE_DURATION_SEC", 3.0)
+_yellow_ratio_default = _read_float_env("YELLOW_MIN_AREA_RATIO", 0.02)
+YELLOW_MIN_AREA_RATIO = min(1.0, max(0.0, _yellow_ratio_default))
+YELLOW_HSV_LOWER = np.array([20, 90, 90], dtype=np.uint8)
+YELLOW_HSV_UPPER = np.array([35, 255, 255], dtype=np.uint8)
+YELLOW_MASK_KERNEL = np.ones((5, 5), dtype=np.uint8)
+
 
 def utc_now_iso(timespec: str = "seconds") -> str:
     """Return an ISO 8601 UTC timestamp with a 'Z' suffix."""
@@ -1475,6 +1482,19 @@ def detect_pest_traps(frame: np.ndarray) -> list[dict[str, Any]]:
     return detections
 
 
+def compute_yellow_ratio(frame: np.ndarray) -> float:
+    """Return ratio of pixels within the yellow HSV range."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, YELLOW_HSV_LOWER, YELLOW_HSV_UPPER)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, YELLOW_MASK_KERNEL)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, YELLOW_MASK_KERNEL)
+    yellow_pixels = cv2.countNonZero(mask)
+    total_pixels = frame.shape[0] * frame.shape[1]
+    if total_pixels <= 0:
+        return 0.0
+    return yellow_pixels / float(total_pixels)
+
+
 def annotate_traps(frame: np.ndarray, trap_detections: list[dict[str, Any]], camera_name: str) -> None:
     for detection in trap_detections:
         corners = detection["corners"]
@@ -1838,8 +1858,10 @@ def start_pipeline(
                     )
 
                 trap_detections = detect_pest_traps(frame)
+                yellow_ratio = compute_yellow_ratio(frame)
+                should_pause_for_yellow = yellow_ratio >= YELLOW_MIN_AREA_RATIO
+
                 if trap_detections:
-                    OBSTACLE_PAUSE_CTRL.pause_for(5.0)
                     annotate_traps(frame, trap_detections, active["name"])
                     for trap_det in trap_detections:
                         db.record_trap_sighting(
@@ -1849,6 +1871,9 @@ def start_pipeline(
                             trap_name=trap_det["trap_name"],
                             location=trap_det["location"],
                         )
+
+                if should_pause_for_yellow:
+                    OBSTACLE_PAUSE_CTRL.pause_for(YELLOW_PAUSE_DURATION_SEC)
 
                 trap_ids_in_view = {detection["marker_id"] for detection in trap_detections}
                 active["visible_traps"] = trap_ids_in_view
@@ -1968,6 +1993,8 @@ def _run_obstacle_detection_thread(
         awaiting_green_stop = False
         final_green_stop_latched = False
         green_detection_latched = False
+        if height_state is not None:
+            height_state.clear()
 
     def format_turn_counter() -> str:
         count = min(turn_green_counter, TURN_GREEN_LIMIT)
