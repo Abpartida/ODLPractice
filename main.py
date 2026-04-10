@@ -1952,7 +1952,7 @@ def _run_obstacle_detection_thread(
     OBST_ROI_X = (640 - OBST_ROI_W) // 2
     OBST_ROI_Y = 0
 
-    LINE_ROI_W, LINE_ROI_H = 200, 200
+    LINE_ROI_W, LINE_ROI_H = 300, 200
     LINE_ROI_X, LINE_ROI_Y = (640 - LINE_ROI_W) // 2, 280
 
     STATE_ROW_OUTWARD = 0
