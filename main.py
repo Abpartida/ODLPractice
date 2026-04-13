@@ -105,12 +105,16 @@ class ObstaclePauseController:
 
 OBSTACLE_PAUSE_CTRL = ObstaclePauseController()
 
-YELLOW_PAUSE_DURATION_SEC = _read_float_env("YELLOW_PAUSE_DURATION_SEC", 3.0)
-_yellow_ratio_default = _read_float_env("YELLOW_MIN_AREA_RATIO", 0.02)
-YELLOW_MIN_AREA_RATIO = min(1.0, max(0.0, _yellow_ratio_default))
-YELLOW_HSV_LOWER = np.array([20, 90, 90], dtype=np.uint8)
-YELLOW_HSV_UPPER = np.array([35, 255, 255], dtype=np.uint8)
-YELLOW_MASK_KERNEL = np.ones((5, 5), dtype=np.uint8)
+_ARUCO_BASE_AREA_RATIO = 0.004  # calibrated for ~40 mm tags at nominal distance
+_ARUCO_REFERENCE_MARKER_MM = 40.0
+aruco_marker_size_mm = _read_float_env("ARUCO_MARKER_SIZE_MM", 25.0)
+if aruco_marker_size_mm > 0.0:
+    scaled_area_ratio = _ARUCO_BASE_AREA_RATIO * (aruco_marker_size_mm / _ARUCO_REFERENCE_MARKER_MM) ** 2
+else:
+    scaled_area_ratio = _ARUCO_BASE_AREA_RATIO
+ARUCO_MIN_AREA_RATIO = min(1.0, max(0.0, _read_float_env("ARUCO_MIN_AREA_RATIO", scaled_area_ratio)))
+ARUCO_PAUSE_DURATION_SEC = _read_float_env("ARUCO_PAUSE_DURATION_SEC", 3.0)
+ARUCO_PAUSE_MIN_COUNT = _read_int_env("ARUCO_PAUSE_MIN_COUNT", 1, minimum=1)
 
 
 def utc_now_iso(timespec: str = "seconds") -> str:
@@ -1346,6 +1350,26 @@ def _build_aruco_detector() -> tuple[Any, Any, Any, Any]:
         parameters = aruco.DetectorParameters()
     else:
         parameters = aruco.DetectorParameters_create()
+    if hasattr(parameters, "minMarkerPerimeterRate"):
+        parameters.minMarkerPerimeterRate = 0.05
+    if hasattr(parameters, "maxMarkerPerimeterRate"):
+        parameters.maxMarkerPerimeterRate = 4.0
+    if hasattr(parameters, "minCornerDistanceRate"):
+        parameters.minCornerDistanceRate = 0.1
+    if hasattr(parameters, "minMarkerDistanceRate"):
+        parameters.minMarkerDistanceRate = 0.07
+    if hasattr(parameters, "adaptiveThreshConstant"):
+        parameters.adaptiveThreshConstant = 7
+    if hasattr(parameters, "adaptiveThreshWinSizeMin"):
+        parameters.adaptiveThreshWinSizeMin = 9
+    if hasattr(parameters, "adaptiveThreshWinSizeStep"):
+        parameters.adaptiveThreshWinSizeStep = 4
+    if hasattr(parameters, "polygonalApproxAccuracyRate"):
+        parameters.polygonalApproxAccuracyRate = 0.02
+    if hasattr(parameters, "cornerRefinementMethod") and hasattr(aruco, "CORNER_REFINE_SUBPIX"):
+        parameters.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+    if hasattr(parameters, "minDistanceToBorder"):
+        parameters.minDistanceToBorder = 5
 
     detector = None
     if hasattr(aruco, "ArucoDetector"):
@@ -1469,30 +1493,23 @@ def detect_pest_traps(frame: np.ndarray) -> list[dict[str, Any]]:
     if ids is None:
         return detections
 
+    frame_area = max(frame.shape[0] * frame.shape[1], 1)
+    min_marker_area = frame_area * max(0.0, ARUCO_MIN_AREA_RATIO)
+
     for marker_corners, marker_id in zip(corners, ids.flatten()):
+        reshaped_corners = marker_corners.reshape((4, 2))
+        if cv2.contourArea(reshaped_corners.astype(np.float32)) < min_marker_area:
+            continue
         trap_info = TRAP_REGISTRY.get(marker_id, {"name": f"Marker {marker_id}", "location": "Unknown"})
         detections.append(
             {
                 "marker_id": int(marker_id),
                 "trap_name": trap_info["name"],
                 "location": trap_info.get("location", "Unknown"),
-                "corners": marker_corners.reshape((4, 2)).astype(int),
+                "corners": reshaped_corners.astype(int),
             }
         )
     return detections
-
-
-def compute_yellow_ratio(frame: np.ndarray) -> float:
-    """Return ratio of pixels within the yellow HSV range."""
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, YELLOW_HSV_LOWER, YELLOW_HSV_UPPER)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, YELLOW_MASK_KERNEL)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, YELLOW_MASK_KERNEL)
-    yellow_pixels = cv2.countNonZero(mask)
-    total_pixels = frame.shape[0] * frame.shape[1]
-    if total_pixels <= 0:
-        return 0.0
-    return yellow_pixels / float(total_pixels)
 
 
 def annotate_traps(frame: np.ndarray, trap_detections: list[dict[str, Any]], camera_name: str) -> None:
@@ -1858,8 +1875,8 @@ def start_pipeline(
                     )
 
                 trap_detections = detect_pest_traps(frame)
-                yellow_ratio = compute_yellow_ratio(frame)
-                should_pause_for_yellow = yellow_ratio >= YELLOW_MIN_AREA_RATIO
+                marker_count = len(trap_detections)
+                should_pause_for_markers = marker_count >= ARUCO_PAUSE_MIN_COUNT
 
                 if trap_detections:
                     annotate_traps(frame, trap_detections, active["name"])
@@ -1872,8 +1889,8 @@ def start_pipeline(
                             location=trap_det["location"],
                         )
 
-                if should_pause_for_yellow:
-                    OBSTACLE_PAUSE_CTRL.pause_for(YELLOW_PAUSE_DURATION_SEC)
+                if should_pause_for_markers:
+                    OBSTACLE_PAUSE_CTRL.pause_for(ARUCO_PAUSE_DURATION_SEC)
 
                 trap_ids_in_view = {detection["marker_id"] for detection in trap_detections}
                 active["visible_traps"] = trap_ids_in_view
@@ -1993,8 +2010,8 @@ def _run_obstacle_detection_thread(
         awaiting_green_stop = False
         final_green_stop_latched = False
         green_detection_latched = False
-        if height_state is not None:
-            height_state.clear()
+        #if height_state is not None:
+        #    height_state.clear()
 
     def format_turn_counter() -> str:
         count = min(turn_green_counter, TURN_GREEN_LIMIT)

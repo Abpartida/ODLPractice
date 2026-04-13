@@ -51,6 +51,40 @@ python main.py
 - By default `RESULT_DIR=my_blobs/pestv5March` and `main.py` auto-picks the `*best*.blob` + its `.json`. Override with the `RESULT_DIR` env var or point individual `CameraSetup` entries at other blobs.
 - `CameraSetup` (near the top of `main.py`) lists every OAK-D device you expect; the script automatically matches connected hardware. Missing devices simply log a warning and the rest of the cameras still come up.
 - `NN_INPUT_SIZE` or `MODEL_INPUT_SIZE` env vars override the blob-implied preview resolution if you export with something non-square.
+- Camera allocation is now explicit. The launcher enumerates the connected OAK-D devices once and splits them into pest-identification vs. navigation pools. Use `PEST_CAMERA_COUNT` (defaults to "all available" unless you also set `OBSTACLE_CAMERA_COUNT`) and `OBSTACLE_CAMERA_COUNT` (default `0`) to pin how many boards each loop may claim. Example: `PEST_CAMERA_COUNT=2 OBSTACLE_CAMERA_COUNT=2 python main.py` reserves the first two MXIDs for the pest YOLO pipeline and the next two for the obstacle thread.
+
+## Autonomous obstacle navigation
+When `OBSTACLE_CAMERA_COUNT` is greater than zero, `main.py` launches a second DepthAI pipeline that treats its dedicated OAK-D pair as a front/rear navigation rig. The loop:
+- streams RGB + aligned depth into the `/video` mosaic with labels such as `obstacle_front` / `obstacle_rear`,
+- maintains a three-state line-following controller (row outward -> row return -> aisle transit) that swaps between the forward and rear cameras automatically, and
+- feeds the Sabertooth drive queue with `FORWARD`, `ARC_*`, `TIGHT_ARC_*`, `BACKWARD`, or `STOP` based on the lane error, rotation of the red/green tape, and a 650 mm safety box rendered over the depth ROI.
+
+The navigation loop only actuates when **both** conditions are true:
+1. `/api/mode` or the WebSocket `{"type":"mode","command":"set","value":"autonomous"}` succeeds.
+2. Canopy heights have been provided (see below). Until then the thread will keep publishing camera frames but enforces `STOP` + `LIFT_STOP`.
+
+### Height gating + automatic lift control
+The robot tracks lower/upper canopy heights so it knows which vertical span to target as it leaves a row, reverses, or transits the aisle. Defaults are 1.5 ft (lower) and 3.0 ft (upper); the controller also drops to 2.0 ft when it has counted the configured number of green lane markers at the end of a route.
+
+- REST: `GET /api/obstacle/heights` reports whether heights are latched, and `POST /api/obstacle/heights {"lower":1.6,"upper":3.1}` updates the pair.
+- WebSocket: send `{"type":"obstacle_heights","action":"set","lower":1.6,"upper":3.1}` or `{"type":"obstacle_heights","action":"get"}`.
+- Mode changes to `autonomous` will fail with HTTP 409 until both values are positive and `upper > lower`.
+- While the loop is active in autonomous mode it queues lift commands (using either live lidar feedback from the ESP32 or the timed fallback controlled by `LIFT_SPEED_FT_PER_SEC`, `LIFT_MOVE_MIN_SEC`, and `LIFT_MOVE_MAX_SEC`) whenever it needs to transition between height bands or finish the final stop.
+
+### Trap-aware navigation pauses
+The pest cameras gate pauses on ArUco trap markers. When at least `ARUCO_PAUSE_MIN_COUNT` valid markers are visible (defaults to `1`), the rover pauses autonomous drive commands for `ARUCO_PAUSE_DURATION_SEC` (defaults to `3` seconds). Marker validation uses the same contour fit from the pest tagging pipeline, plus an area floor derived from `ARUCO_MARKER_SIZE_MM`/`ARUCO_MIN_AREA_RATIO`, so noisy squares no longer trip the pause.
+
+### Navigation-specific environment toggles
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PEST_CAMERA_COUNT` | *(all devices unless both counts are zero)* | Number of OAK-D units reserved for YOLO/trap detection. |
+| `OBSTACLE_CAMERA_COUNT` | `0` | Number of OAK-D units reserved for the navigation loop (0 disables it). |
+| `ARUCO_MARKER_SIZE_MM` | `25.0` | Physical width of the printed trap markers; used to derive a sane area floor. |
+| `ARUCO_MIN_AREA_RATIO` | *(auto from size)* | Override the minimum portion of the frame a marker must cover. |
+| `ARUCO_PAUSE_MIN_COUNT` | `1` | Number of simultaneously visible markers required to pause drive commands. |
+| `ARUCO_PAUSE_DURATION_SEC` | `3.0` | How long to hold autonomous motion after a marker-triggered pause. |
+| `LIFT_SPEED_FT_PER_SEC` | `0.8` | Estimated lift speed used when lidar feedback is unavailable. |
+| `LIFT_MOVE_MIN_SEC` / `LIFT_MOVE_MAX_SEC` | `0.4` / `4.0` | Bounds for timed lift moves when running open-loop. |
 
 ## Browser stream + REST API
 Running `main.py` exposes both the MJPEG composite and JSON endpoints on `http://<host>:5000`.
@@ -82,6 +116,8 @@ Common payloads:
 - `type: "fan"` maps `on`/`off` into `FAN_ON_COMMAND`/`FAN_OFF_COMMAND`.
 - `type: "mode"` supports `{"command":"get"}` and `{"command":"set","value":"manual|autonomous"}`.
 - `type: "status"` probes `STAT?` on the Sabertooth and returns the latest rover mode.
+- `type: "obstacle_heights"` mirrors the REST helper; use `{"action":"set","lower":1.6,"upper":3.1}` to seed the canopy span before toggling autonomous mode.
+- While the obstacle navigation thread is running **and** the robot is in autonomous mode, drive/lift/fan overrides return HTTP 423 / WebSocket errors so operators do not fight the planner. Drop back to manual mode (or launch without `OBSTACLE_CAMERA_COUNT`) before issuing manual moves.
 
 Legacy REST endpoints like `POST /api/drive/forward`, `/api/lift/up`, `/api/fan/on`, and `POST /api/mode` are still exposed for compatibility, but new tooling should prefer the WebSocket channel to avoid request-per-command latency spikes.
 
