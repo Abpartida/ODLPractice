@@ -1829,6 +1829,7 @@ def start_pipeline(
             raise RuntimeError("[ERROR] No active devices configured.")
 
         unique_traps_seen: set[int] = set()
+        aruco_scan_resume_at = 0.0  # monotonic timestamp until which marker scanning is paused
         while True:
             for active in active_devices:
                 in_cam = active["cam_queue"].tryGet()
@@ -1874,7 +1875,25 @@ def start_pipeline(
                         1,
                     )
 
-                trap_detections = detect_pest_traps(frame)
+                now_monotonic = time.monotonic()
+                can_scan_for_markers = now_monotonic >= aruco_scan_resume_at
+                if can_scan_for_markers:
+                    trap_detections = detect_pest_traps(frame)
+                else:
+                    trap_detections: list[dict[str, Any]] = []
+                    remaining_pause = aruco_scan_resume_at - now_monotonic
+                    if remaining_pause > 0:
+                        pause_label = f"Marker scan paused {remaining_pause:.1f}s"
+                        cv2.putText(
+                            frame,
+                            pause_label,
+                            (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (0, 165, 255),
+                            2,
+                        )
+
                 marker_count = len(trap_detections)
                 should_pause_for_markers = marker_count >= ARUCO_PAUSE_MIN_COUNT
 
@@ -1890,7 +1909,9 @@ def start_pipeline(
                         )
 
                 if should_pause_for_markers:
-                    OBSTACLE_PAUSE_CTRL.pause_for(ARUCO_PAUSE_DURATION_SEC)
+                    pause_duration = ARUCO_PAUSE_DURATION_SEC
+                    aruco_scan_resume_at = now_monotonic + pause_duration
+                    OBSTACLE_PAUSE_CTRL.pause_for(pause_duration)
 
                 trap_ids_in_view = {detection["marker_id"] for detection in trap_detections}
                 active["visible_traps"] = trap_ids_in_view
@@ -2143,21 +2164,25 @@ def _run_obstacle_detection_thread(
         rgb_qs: list[dai.DataOutputQueue] = []
         depth_qs: list[dai.DataOutputQueue] = []
 
+        cam_a_socket = getattr(dai.CameraBoardSocket, "CAM_A", dai.CameraBoardSocket.RGB)
+        cam_b_socket = getattr(dai.CameraBoardSocket, "CAM_B", dai.CameraBoardSocket.LEFT)
+        cam_c_socket = getattr(dai.CameraBoardSocket, "CAM_C", dai.CameraBoardSocket.RIGHT)
+
         for i, info in enumerate(device_infos):
             pipeline = dai.Pipeline()
 
             left = pipeline.create(dai.node.MonoCamera)
-            left.setBoardSocket(dai.CameraBoardSocket.LEFT)
+            left.setBoardSocket(cam_b_socket)
             left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
             left.setFps(30)
 
             right = pipeline.create(dai.node.MonoCamera)
-            right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
+            right.setBoardSocket(cam_c_socket)
             right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
             right.setFps(30)
 
             rgb_cam = pipeline.create(dai.node.ColorCamera)
-            rgb_cam.setBoardSocket(dai.CameraBoardSocket.RGB)
+            rgb_cam.setBoardSocket(cam_a_socket)
             rgb_cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
             rgb_cam.setPreviewSize(640, 480)
             rgb_cam.setInterleaved(False)
@@ -2166,7 +2191,7 @@ def _run_obstacle_detection_thread(
             stereo = pipeline.create(dai.node.StereoDepth)
             stereo.setLeftRightCheck(True)
             stereo.setSubpixel(False)
-            stereo.setDepthAlign(dai.CameraBoardSocket.RGB)
+            stereo.setDepthAlign(cam_a_socket)
             stereo.setOutputSize(640, 480)
             left.out.link(stereo.left)
             right.out.link(stereo.right)
@@ -2181,7 +2206,7 @@ def _run_obstacle_detection_thread(
             rgb_cam.preview.link(rgb_xout.input)
             stereo.depth.link(depth_xout.input)
 
-            device = stack.enter_context(dai.Device(pipeline, info))
+            device = stack.enter_context(create_device_context(pipeline, info))
 
             rgb_qs.append(device.getOutputQueue(rgb_stream_name, maxSize=4, blocking=False))
             depth_qs.append(device.getOutputQueue(depth_stream_name, maxSize=4, blocking=False))
