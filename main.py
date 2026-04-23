@@ -1997,7 +1997,7 @@ def _run_obstacle_detection_thread(
     STATE_ROW_RETURN = 1
     STATE_AISLE_TRANSIT = 2
     current_nav_state = STATE_ROW_OUTWARD
-    TURN_GREEN_LIMIT = 2
+    TURN_GREEN_LIMIT = 3
     FINAL_STOP_HEIGHT_FT = 2.0
     turn_green_counter = 0
     awaiting_green_stop = False
